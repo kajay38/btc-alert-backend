@@ -18,6 +18,24 @@ def home():
     """Returns a simple status message to confirm the backend is running."""
     return {"status": "BTC Alert Backend Running"}
 
+@app.get("/tickers", summary="Get Raw Ticker Data")
+def get_tickers():
+    """
+    Fetches and returns the raw ticker data from the external API for debugging purposes.
+    You can check this endpoint to confirm if the contract structure or symbol has changed.
+    """
+    try:
+        logging.info(f"Fetching raw data from: {TICKERS_URL}")
+        r = requests.get(TICKERS_URL, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as req_e:
+        logging.error(f"HTTP/Network Error fetching raw tickers: {req_e}")
+        return {"error": f"Failed to connect to external API: {req_e}"}
+    except Exception as e:
+        logging.error(f"An unexpected error occurred fetching raw tickers: {e}")
+        return {"error": f"An internal error occurred: {e}"}
+
 @app.get("/price", summary="Get BTC Perpetual Price", response_model=Dict[str, Any])
 def get_price():
     """
