@@ -3,87 +3,63 @@ import requests
 
 app = FastAPI()
 
-BASE_URL = "https://api.delta.exchange/v2/tickers"
+PRODUCT_ID = 27
+TICKER_URL = f"https://api.delta.exchange/v2/tickers/{PRODUCT_ID}"
 
-INSTRUMENTS = {
-    "BTC": {"product_id": 27, "sell": 90200, "buy": 89800},
-    "ETH": {"product_id": 3136, "sell": 5100, "buy": 4900},
-    "SOL": {"sell": 220, "buy": 200},
-}
+# ---- ALERT LEVELS (static for now) ----
+SELL_ALERT = 90200
+BUY_ALERT = 89800
 
 @app.get("/")
 def home():
-    return {"status": "Multi-Asset Alert Backend Running"}
+    return {"status": "BTCUSD Alert Backend Running"}
 
-def safe_price(value):
-    try:
-        return float(value)
-    except:
-        return None
-
-def get_price_by_product(product_id):
-    r = requests.get(f"{BASE_URL}/{product_id}", timeout=10)
+@app.get("/price")
+def get_price():
+    r = requests.get(TICKER_URL, timeout=10)
     r.raise_for_status()
-    data = r.json().get("result", {})
+    data = r.json()["result"]
 
-    price = safe_price(
+    price = (
         data.get("mark_price")
         or data.get("last_price")
         or data.get("index_price")
     )
-    return price, data.get("symbol")
 
-def get_sol_price():
-    r = requests.get(BASE_URL, timeout=10)
+    return {
+        "product_id": PRODUCT_ID,
+        "symbol": data.get("symbol"),
+        "price": float(price)
+    }
+
+@app.get("/check-alert")
+def check_alert():
+    r = requests.get(TICKER_URL, timeout=10)
     r.raise_for_status()
+    data = r.json()["result"]
 
-    for item in r.json().get("result", []):
-        if (
-            item.get("contract_type") == "perpetual"
-            and item.get("underlying_asset", {}).get("symbol") == "SOL"
-        ):
-            price = safe_price(
-                item.get("mark_price")
-                or item.get("last_price")
-                or item.get("index_price")
-            )
-            return price, item.get("symbol")
-    return None, None
+    price = float(
+        data.get("mark_price")
+        or data.get("last_price")
+        or data.get("index_price")
+    )
 
-@app.get("/prices")
-def prices():
-    output = {}
+    if price >= SELL_ALERT:
+        return {
+            "alert": "SELL ZONE HIT",
+            "price": price,
+            "level": SELL_ALERT
+        }
 
-    for name, cfg in INSTRUMENTS.items():
-        if "product_id" in cfg:
-            price, symbol = get_price_by_product(cfg["product_id"])
-            output[name] = {"symbol": symbol, "price": price}
+    if price <= BUY_ALERT:
+        return {
+            "alert": "BUY ZONE HIT",
+            "price": price,
+            "level": BUY_ALERT
+        }
 
-    sol_price, sol_symbol = get_sol_price()
-    output["SOL"] = {"symbol": sol_symbol, "price": sol_price}
+    return {
+        "alert": "NO ALERT",
+        "price": price
+    }
 
-    return output
-
-@app.get("/check-alerts")
-def check_alerts():
-    alerts = []
-
-    for name, cfg in INSTRUMENTS.items():
-        if "product_id" in cfg:
-            price, _ = get_price_by_product(cfg["product_id"])
-            if price is None:
-                continue
-
-            if price >= cfg["sell"]:
-                alerts.append(f"{name} SELL zone @ {price}")
-            elif price <= cfg["buy"]:
-                alerts.append(f"{name} BUY zone @ {price}")
-
-    sol_price, _ = get_sol_price()
-    if sol_price is not None:
-        if sol_price >= INSTRUMENTS["SOL"]["sell"]:
-            alerts.append(f"SOL SELL zone @ {sol_price}")
-        elif sol_price <= INSTRUMENTS["SOL"]["buy"]:
-            alerts.append(f"SOL BUY zone @ {sol_price}")
-
-    return {"alerts": alerts or ["NO ALERT"]}
