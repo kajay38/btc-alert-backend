@@ -54,8 +54,8 @@ def get_price():
             contract = item.get("contract_type")
             underlying = item.get("underlying_asset", {})
 
-            # Filter criterion: contract_type is "perpetual" and underlying asset symbol is "BTC"
-            if contract == "perpetual" and underlying.get("symbol") == "BTC":
+            # FIX: Changed "perpetual" to the correct "perpetual_futures" based on raw data inspection.
+            if contract == "perpetual_futures" and underlying.get("symbol") == "BTC":
                 # Get the price, prioritizing mark_price, then last_price, then index_price
                 price_str = (
                     item.get("mark_price")
@@ -74,6 +74,7 @@ def get_price():
 
         # 3. Handle case where contract is not found
         logging.warning("BTC perpetual contract not found in the ticker list.")
+        # Revert to the original error message now that the contract type is fixed
         return {"error": "BTC perpetual contract not found"}
 
     except requests.exceptions.RequestException as req_e:
