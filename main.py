@@ -17,25 +17,19 @@ def get_price():
         data = res.json()
 
         for item in data.get("result", []):
-            symbol = item.get("symbol", "")
-
-            # Perpetual BTC contract
-            if "BTC" in symbol and "USD" in symbol:
+            if item.get("symbol") == "BTCUSD_PERP":
                 price = (
                     item.get("mark_price")
                     or item.get("last_price")
                     or item.get("index_price")
                 )
 
-                if price:
-                    return {
-                        "symbol": symbol,
-                        "price": float(price)
-                    }
+                return {
+                    "symbol": "BTCUSD_PERP",
+                    "price": float(price)
+                }
 
-        return {"error": "BTC price not found"}
+        return {"error": "BTCUSD_PERP not found"}
 
     except Exception as e:
         return {"error": str(e)}
-
-
