@@ -12,22 +12,30 @@ def home():
 @app.get("/price")
 def get_price():
     try:
-        response = requests.get(DELTA_URL, timeout=10)
-        response.raise_for_status()
-        json_data = response.json()
+        res = requests.get(DELTA_URL, timeout=10)
+        res.raise_for_status()
+        data = res.json()
 
-        if "result" not in json_data:
-            return {"error": "Invalid API response", "raw": json_data}
+        for item in data.get("result", []):
+            symbol = item.get("symbol", "")
 
-        for item in json_data["result"]:
-            if item.get("symbol") == "BTCUSD":
-                return {
-                    "symbol": "BTCUSD",
-                    "price": float(item.get("last_price", 0))
-                }
+            # Perpetual BTC contract
+            if "BTC" in symbol and "USD" in symbol:
+                price = (
+                    item.get("mark_price")
+                    or item.get("last_price")
+                    or item.get("index_price")
+                )
 
-        return {"error": "BTCUSD not found"}
+                if price:
+                    return {
+                        "symbol": symbol,
+                        "price": float(price)
+                    }
+
+        return {"error": "BTC price not found"}
 
     except Exception as e:
         return {"error": str(e)}
+
 
