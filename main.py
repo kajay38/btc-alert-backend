@@ -3,7 +3,7 @@ import requests
 
 app = FastAPI()
 
-DELTA_URL = "https://api.delta.exchange/v2/tickers"
+TICKERS_URL = "https://api.delta.exchange/v2/tickers"
 
 @app.get("/")
 def home():
@@ -12,25 +12,29 @@ def home():
 @app.get("/price")
 def get_price():
     try:
-        res = requests.get(DELTA_URL, timeout=10)
-        res.raise_for_status()
-        data = res.json()
+        r = requests.get(TICKERS_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
 
         for item in data.get("result", []):
-            if item.get("symbol") == "BTCUSD_PERP":
+            contract = item.get("contract_type")
+            underlying = item.get("underlying_asset", {})
+
+            # ✅ BTC Perpetual Future
+            if contract == "perpetual" and underlying.get("symbol") == "BTC":
                 price = (
                     item.get("mark_price")
                     or item.get("last_price")
                     or item.get("index_price")
                 )
 
-                return {
-                    "symbol": "BTCUSD_PERP",
-                    "price": float(price)
-                }
+                if price:
+                    return {
+                        "symbol": item.get("symbol"),
+                        "price": float(price)
+                    }
 
-        return {"error": "BTCUSD_PERP not found"}
+        return {"error": "BTC perpetual contract not found"}
 
     except Exception as e:
         return {"error": str(e)}
-
