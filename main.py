@@ -3,63 +3,39 @@ import requests
 
 app = FastAPI()
 
+# BTCUSD Perpetual Futures (Delta Exchange)
 PRODUCT_ID = 27
 TICKER_URL = f"https://api.delta.exchange/v2/tickers/{PRODUCT_ID}"
 
-# ---- ALERT LEVELS (static for now) ----
-SELL_ALERT = 90200
-BUY_ALERT = 89800
-
 @app.get("/")
 def home():
-    return {"status": "BTCUSD Alert Backend Running"}
+    return {"status": "BTCUSD Backend Running"}
 
 @app.get("/price")
 def get_price():
-    r = requests.get(TICKER_URL, timeout=10)
-    r.raise_for_status()
-    data = r.json()["result"]
+    try:
+        r = requests.get(TICKER_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
 
-    price = (
-        data.get("mark_price")
-        or data.get("last_price")
-        or data.get("index_price")
-    )
+        result = data.get("result", {})
 
-    return {
-        "product_id": PRODUCT_ID,
-        "symbol": data.get("symbol"),
-        "price": float(price)
-    }
+        price = (
+            result.get("mark_price")
+            or result.get("last_price")
+            or result.get("index_price")
+        )
 
-@app.get("/check-alert")
-def check_alert():
-    r = requests.get(TICKER_URL, timeout=10)
-    r.raise_for_status()
-    data = r.json()["result"]
+        if not price:
+            return {"error": "Price not available", "raw": result}
 
-    price = float(
-        data.get("mark_price")
-        or data.get("last_price")
-        or data.get("index_price")
-    )
-
-    if price >= SELL_ALERT:
         return {
-            "alert": "SELL ZONE HIT",
-            "price": price,
-            "level": SELL_ALERT
+            "product_id": PRODUCT_ID,
+            "symbol": result.get("symbol"),
+            "price": float(price)
         }
 
-    if price <= BUY_ALERT:
-        return {
-            "alert": "BUY ZONE HIT",
-            "price": price,
-            "level": BUY_ALERT
-        }
+    except Exception as e:
+        return {"error": str(e)}
 
-    return {
-        "alert": "NO ALERT",
-        "price": price
-    }
 
