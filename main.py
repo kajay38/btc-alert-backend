@@ -63,14 +63,22 @@ async def delta_ws_listener():
 
                     # ✅ CORRECT PARSING
                     if data.get("type") == "ticker" and "data" in data:
-                        ticker = data["data"]
+    ticker = data["data"]
 
-                        if ticker.get("symbol") == "BTCUSD":
-                            latest_ticks["BTCUSD"] = {
-                                "symbol": "BTCUSD",
-                                "price": float(ticker.get("mark_price", 0)),
-                                "timestamp": datetime.utcnow().isoformat()
-                            }
+    if ticker.get("symbol") == "BTCUSD":
+        raw_price = (
+            ticker.get("mark_price")
+            or ticker.get("close")
+            or ticker.get("index_price")
+        )
+
+        if raw_price:
+            latest_ticks["BTCUSD"] = {
+                "symbol": "BTCUSD",
+                "price": float(raw_price),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
 
         except Exception as e:
             is_connected = False
