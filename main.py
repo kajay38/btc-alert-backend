@@ -21,7 +21,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DELTA_WS_URL = "wss://stream.india.delta.exchange/v2/websocket"
+DELTA_WS_URL = "wss://socket.delta.exchange"
+
 
 SYMBOLS = ["BTCUSD"]
 
@@ -36,34 +37,32 @@ async def delta_ws_listener():
     while True:
         try:
             async with websockets.connect(
-                DELTA_WS_URL,
+                "wss://socket.delta.exchange",
                 ping_interval=20,
                 ping_timeout=20,
             ) as ws:
 
-                subscribe_msg = {
+                await ws.send(json.dumps({
                     "type": "subscribe",
                     "payload": {
                         "channels": [
                             {
                                 "name": "ticker",
-                                "symbols": SYMBOLS
+                                "symbols": ["BTCUSD"]
                             }
                         ]
                     }
-                }
+                }))
 
-                await ws.send(json.dumps(subscribe_msg))
                 is_connected = True
                 print("✅ Connected to Delta WS")
 
                 async for msg in ws:
                     data = json.loads(msg)
 
-                    if "symbol" in data and "mark_price" in data:
-                        symbol = data["symbol"]
-                        latest_ticks[symbol] = {
-                            "symbol": symbol,
+                    if data.get("type") == "ticker":
+                        latest_ticks["BTCUSD"] = {
+                            "symbol": "BTCUSD",
                             "price": float(data["mark_price"]),
                             "timestamp": datetime.utcnow().isoformat()
                         }
@@ -71,7 +70,6 @@ async def delta_ws_listener():
         except Exception as e:
             is_connected = False
             print("❌ Delta WS error:", e)
-            print("🔄 Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
 
