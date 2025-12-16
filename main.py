@@ -1,17 +1,15 @@
 import asyncio
 import json
-import os
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import websockets
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
-# ================= SETUP =================
-load_dotenv()
-
+# ===============================
+# APP SETUP
+# ===============================
 app = FastAPI(title="Delta WS Backend")
 
 app.add_middleware(
@@ -21,23 +19,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===============================
+# GLOBAL STATE
+# ===============================
 DELTA_WS_URL = "wss://socket.delta.exchange"
+SYMBOL = "BTCUSD"
 
+latest_ticks: Dict[str, Dict[str, Any]] = {
+    SYMBOL: {
+        "symbol": SYMBOL,
+        "price": 0.0,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+}
 
-SYMBOLS = ["BTCUSD"]
-
-latest_ticks: Dict[str, Dict[str, Any]] = {}
 is_connected = False
 
 
-# ================= DELTA WS =================
+# ===============================
+# ROOT (Railway health check)
+# ===============================
+@app.get("/")
+def home():
+    return {
+        "status": "ok",
+        "service": "Delta WebSocket Backend",
+        "symbol": SYMBOL,
+    }
+
+
+# ===============================
+# STATUS API
+# ===============================
+@app.get("/status")
+def status():
+    return {
+        "status": "up",
+        "delta_ws": "connected" if is_connected else "disconnected",
+        "ticks": latest_ticks,
+        "time": datetime.utcnow().isoformat(),
+    }
+
+
+# ===============================
+# DELTA WEBSOCKET LISTENER
+# ===============================
 async def delta_ws_listener():
     global is_connected
 
     while True:
         try:
+            print("🔄 Connecting to Delta WebSocket...")
             async with websockets.connect(
-                "wss://socket.delta.exchange",
+                DELTA_WS_URL,
                 ping_interval=20,
                 ping_timeout=20,
             ) as ws:
@@ -48,10 +82,10 @@ async def delta_ws_listener():
                         "channels": [
                             {
                                 "name": "ticker",
-                                "symbols": ["BTCUSD"]
+                                "symbols": [SYMBOL],
                             }
                         ]
-                    }
+                    },
                 }
 
                 await ws.send(json.dumps(subscribe_msg))
@@ -59,64 +93,58 @@ async def delta_ws_listener():
                 print("✅ Connected to Delta WS")
 
                 async for msg in ws:
+                    await asyncio.sleep(0)  # 🔑 prevent event-loop blocking
                     data = json.loads(msg)
 
-                    # ✅ CORRECT PARSING
+                    # ✅ Robust ticker parsing
                     if data.get("type") == "ticker" and "data" in data:
-    ticker = data["data"]
+                        ticker = data["data"]
 
-    if ticker.get("symbol") == "BTCUSD":
-        raw_price = (
-            ticker.get("mark_price")
-            or ticker.get("close")
-            or ticker.get("index_price")
-        )
+                        if ticker.get("symbol") == SYMBOL:
+                            raw_price = (
+                                ticker.get("mark_price")
+                                or ticker.get("close")
+                                or ticker.get("index_price")
+                            )
 
-        if raw_price:
-            latest_ticks["BTCUSD"] = {
-                "symbol": "BTCUSD",
-                "price": float(raw_price),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
+                            if raw_price:
+                                latest_ticks[SYMBOL] = {
+                                    "symbol": SYMBOL,
+                                    "price": float(raw_price),
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                }
 
         except Exception as e:
             is_connected = False
             print("❌ Delta WS error:", e)
+            print("🔁 Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
 
+# ===============================
+# STARTUP EVENT (Railway-Safe)
+# ===============================
 @app.on_event("startup")
 async def startup():
-    for s in SYMBOLS:
-        latest_ticks[s] = {
-            "symbol": s,
-            "price": 0.0,
-            "timestamp": datetime.utcnow().isoformat()
-        }
+    print("🚀 Backend starting...")
 
-    asyncio.create_task(delta_ws_listener())
-    print("🚀 Backend started, WS task running")
+    async def start_ws():
+        # ⏳ Delay so Railway health check passes
+        await asyncio.sleep(3)
+        await delta_ws_listener()
+
+    asyncio.create_task(start_ws())
 
 
-# ================= FLUTTER WS =================
+# ===============================
+# FLUTTER WEBSOCKET
+# ===============================
 @app.websocket("/ws/tickers")
 async def flutter_ws(ws: WebSocket):
     await ws.accept()
     try:
         while True:
             await ws.send_json({"ticks": latest_ticks})
-            await asyncio.sleep(0.2)  # 200ms tick
+            await asyncio.sleep(0.5)  # 500ms update
     except:
         pass
-
-
-# ================= REST =================
-@app.get("/status")
-def status():
-    return {
-        "status": "up",
-        "delta_ws": "connected" if is_connected else "disconnected",
-        "ticks": latest_ticks,
-        "time": datetime.utcnow().isoformat()
-    }
