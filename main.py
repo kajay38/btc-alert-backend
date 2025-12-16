@@ -86,7 +86,6 @@ async def delta_ws_listener():
             await asyncio.sleep(5)
 
 
-
 @app.on_event("startup")
 async def startup():
     for s in SYMBOLS:
