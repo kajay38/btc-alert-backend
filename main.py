@@ -97,22 +97,26 @@ async def delta_ws_listener():
                     data = json.loads(msg)
 
                     # ✅ Robust ticker parsing
-                    if data.get("type") == "ticker" and "data" in data:
-                        ticker = data["data"]
+                    # ✅ Correct ticker parsing for Delta Exchange
+if data.get("type") == "ticker":
+    symbol = data.get("symbol")
+    
+    if symbol == SYMBOL:
+        # Try different price fields in order of preference
+        raw_price = (
+            data.get("mark_price")
+            or data.get("spot_price") 
+            or data.get("close")
+        )
+        
+        if raw_price:
+            latest_ticks[SYMBOL] = {
+                "symbol": SYMBOL,
+                "price": float(raw_price),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            print(f"📊 {SYMBOL}: ${raw_price}")  # Debug log
 
-                        if ticker.get("symbol") == SYMBOL:
-                            raw_price = (
-                                ticker.get("mark_price")
-                                or ticker.get("close")
-                                or ticker.get("index_price")
-                            )
-
-                            if raw_price:
-                                latest_ticks[SYMBOL] = {
-                                    "symbol": SYMBOL,
-                                    "price": float(raw_price),
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                }
 
         except Exception as e:
             is_connected = False
