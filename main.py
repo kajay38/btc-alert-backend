@@ -42,7 +42,7 @@ async def delta_ws_listener():
                 ping_timeout=20,
             ) as ws:
 
-                await ws.send(json.dumps({
+                subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
@@ -52,25 +52,31 @@ async def delta_ws_listener():
                             }
                         ]
                     }
-                }))
+                }
 
+                await ws.send(json.dumps(subscribe_msg))
                 is_connected = True
                 print("✅ Connected to Delta WS")
 
                 async for msg in ws:
                     data = json.loads(msg)
 
-                    if data.get("type") == "ticker":
-                        latest_ticks["BTCUSD"] = {
-                            "symbol": "BTCUSD",
-                            "price": float(data["mark_price"]),
-                            "timestamp": datetime.utcnow().isoformat()
-                        }
+                    # ✅ CORRECT PARSING
+                    if data.get("type") == "ticker" and "data" in data:
+                        ticker = data["data"]
+
+                        if ticker.get("symbol") == "BTCUSD":
+                            latest_ticks["BTCUSD"] = {
+                                "symbol": "BTCUSD",
+                                "price": float(ticker.get("mark_price", 0)),
+                                "timestamp": datetime.utcnow().isoformat()
+                            }
 
         except Exception as e:
             is_connected = False
             print("❌ Delta WS error:", e)
             await asyncio.sleep(5)
+
 
 
 @app.on_event("startup")
