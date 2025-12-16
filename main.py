@@ -76,12 +76,13 @@ async def delta_ws_listener():
                 ping_timeout=20,
             ) as ws:
 
+                # ✅ FIXED: Use correct channel name "v2/ticker"
                 subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
                             {
-                                "name": "ticker",
+                                "name": "v2/ticker",  # Changed from "ticker" to "v2/ticker"
                                 "symbols": [SYMBOL],
                             }
                         ]
@@ -89,34 +90,51 @@ async def delta_ws_listener():
                 }
 
                 await ws.send(json.dumps(subscribe_msg))
-                is_connected = True
-                print("✅ Connected to Delta WS")
+                print(f"📤 Sent subscription request for {SYMBOL}")
 
                 async for msg in ws:
-                    await asyncio.sleep(0)  # 🔑 prevent event-loop blocking
+                    await asyncio.sleep(0)  # prevent event-loop blocking
                     data = json.loads(msg)
 
-                    # ✅ Robust ticker parsing
-                    if data.get("type") == "ticker" and "data" in data:
-                        ticker = data["data"]
+                    # Handle subscription confirmation
+                    if data.get("type") == "subscriptions":
+                        is_connected = True
+                        print(f"✅ Subscription confirmed: {data}")
+                        continue
 
-                        if ticker.get("symbol") == SYMBOL:
-                            raw_price = (
-                                ticker.get("mark_price")
-                                or ticker.get("close")
-                                or ticker.get("index_price")
-                            )
+                    # ✅ FIXED: Correct ticker data parsing
+                    # Delta sends ticker data directly at root level, not nested in "data"
+                    if data.get("symbol") == SYMBOL:
+                        # Try different price fields in order of preference
+                        raw_price = (
+                            data.get("mark_price")      # Primary: mark price
+                            or data.get("spot_price")   # Fallback: spot price
+                            or data.get("close")        # Fallback: close price
+                        )
 
-                            if raw_price:
-                                latest_ticks[SYMBOL] = {
-                                    "symbol": SYMBOL,
-                                    "price": float(raw_price),
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                }
+                        if raw_price:
+                            price_float = float(raw_price)
+                            latest_ticks[SYMBOL] = {
+                                "symbol": SYMBOL,
+                                "price": price_float,
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "open": float(data.get("open", 0)),
+                                "high": float(data.get("high", 0)),
+                                "low": float(data.get("low", 0)),
+                                "close": float(data.get("close", 0)),
+                                "volume": data.get("volume", 0),
+                            }
+                            print(f"📊 {SYMBOL}: ${price_float:,.2f}")
+
+        except websockets.exceptions.ConnectionClosed as e:
+            is_connected = False
+            print(f"❌ WebSocket connection closed: {e}")
+            print("🔁 Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
 
         except Exception as e:
             is_connected = False
-            print("❌ Delta WS error:", e)
+            print(f"❌ Delta WS error: {type(e).__name__} - {e}")
             print("🔁 Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
@@ -142,9 +160,10 @@ async def startup():
 @app.websocket("/ws/tickers")
 async def flutter_ws(ws: WebSocket):
     await ws.accept()
+    print("📱 Flutter client connected")
     try:
         while True:
             await ws.send_json({"ticks": latest_ticks})
             await asyncio.sleep(0.5)  # 500ms update
-    except:
-        pass
+    except Exception as e:
+        print(f"📱 Flutter client disconnected: {e}")
