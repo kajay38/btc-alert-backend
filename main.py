@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ===============================
 # APP SETUP
 # ===============================
-app = FastAPI(title="Delta WS Backend (LTP Mode)")
+app = FastAPI(title="Delta WS Backend - Ultra Realtime")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,54 +31,40 @@ SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD"]
 latest_ticks: Dict[str, Dict[str, Any]] = {}
 is_connected = False
 
-# Initialize symbols
-for symbol in SYMBOLS:
-    latest_ticks[symbol] = {
-        "symbol": symbol,
-        "price": 0.0,        # LTP (main price)
-        "ltp": 0.0,
+for s in SYMBOLS:
+    latest_ticks[s] = {
+        "symbol": s,
+        "price": 0.0,          # display price (smooth)
+        "ltp": 0.0,            # last traded price
+        "bid": 0.0,
+        "ask": 0.0,
         "mark_price": 0.0,
-        "spot_price": 0.0,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
 # ===============================
-# HEALTH CHECK
+# HEALTH
 # ===============================
 @app.get("/")
 def home():
-    return {
-        "status": "ok",
-        "service": "Delta WebSocket Backend",
-        "mode": "LTP (Delta App Match)",
-        "symbols": SYMBOLS,
-    }
-
-@app.get("/status")
-def status():
-    return {
-        "status": "up",
-        "delta_ws": "connected" if is_connected else "disconnected",
-        "ticks": latest_ticks,
-        "time": datetime.utcnow().isoformat(),
-    }
+    return {"status": "ok", "mode": "Delta Style Ultra Realtime"}
 
 # ===============================
-# DELTA WEBSOCKET LISTENER
+# DELTA WS LISTENER (NO DELAY)
 # ===============================
 async def delta_ws_listener():
     global is_connected
 
     while True:
         try:
-            print("🔄 Connecting to Delta WebSocket...")
+            print("🔄 Connecting Delta WS...")
             async with websockets.connect(
                 DELTA_WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=15,
+                ping_timeout=15,
             ) as ws:
 
-                subscribe_msg = {
+                sub = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
@@ -90,109 +76,88 @@ async def delta_ws_listener():
                     },
                 }
 
-                await ws.send(json.dumps(subscribe_msg))
-                print(f"📤 Subscribed: {', '.join(SYMBOLS)}")
+                await ws.send(json.dumps(sub))
+                print("✅ Subscribed to Delta ticker")
 
                 async for msg in ws:
                     data = json.loads(msg)
 
-                    # Subscription confirmation
                     if data.get("type") == "subscriptions":
                         is_connected = True
-                        print("✅ Delta WS subscribed")
                         continue
 
                     symbol = data.get("symbol")
                     if symbol not in SYMBOLS:
                         continue
 
-                    # ===============================
-                    # 🔥 PRICE LOGIC (DELTA APP STYLE)
-                    # ===============================
-                    ltp = data.get("close")          # ✅ LAST TRADED PRICE
-                    spot = data.get("spot_price")
+                    # ---------- RAW DATA ----------
+                    ltp = data.get("close")
+                    bid = data.get("best_bid")
+                    ask = data.get("best_ask")
                     mark = data.get("mark_price")
 
-                    raw_price = ltp or spot or mark
-                    if not raw_price:
+                    # ---------- DISPLAY PRICE (SMOOTH) ----------
+                    # Delta-style: mid price if bid/ask available
+                    if bid and ask:
+                        display_price = (float(bid) + float(ask)) / 2
+                    else:
+                        display_price = ltp or mark
+
+                    if not display_price:
                         continue
 
                     latest_ticks[symbol] = {
                         "symbol": symbol,
 
-                        # 🔥 MAIN PRICE (Flutter uses this)
-                        "price": float(raw_price),
+                        # 🔥 UI PRICE (moves continuously)
+                        "price": float(display_price),
+
+                        # 🎯 REAL TRADE PRICE
                         "ltp": float(ltp) if ltp else None,
 
-                        # 🛡 Safety / info
+                        # 📊 ORDER BOOK
+                        "bid": float(bid) if bid else None,
+                        "ask": float(ask) if ask else None,
+
+                        # 🛡 SAFETY
                         "mark_price": float(mark) if mark else None,
-                        "spot_price": float(spot) if spot else None,
 
-                        # 📊 Market data
-                        "open": float(data.get("open", 0)),
-                        "high": float(data.get("high", 0)),
-                        "low": float(data.get("low", 0)),
-                        "close": float(ltp) if ltp else 0,
-                        "volume": data.get("volume", 0),
-
-                        # ⏱ Time
                         "timestamp": datetime.utcnow().isoformat(),
                     }
 
-                    print(f"📊 {symbol} LTP: ${float(raw_price):,.2f}")
-
-        except websockets.exceptions.ConnectionClosed as e:
-            is_connected = False
-            print(f"❌ WS closed: {e}")
-            print("🔁 Reconnecting in 5s...")
-            await asyncio.sleep(5)
-
         except Exception as e:
             is_connected = False
-            print(f"❌ WS error: {type(e).__name__} - {e}")
-            print("🔁 Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            print(f"❌ Delta WS error: {e}")
+            await asyncio.sleep(3)
 
 # ===============================
-# STARTUP (RAILWAY SAFE)
+# STARTUP
 # ===============================
 @app.on_event("startup")
 async def startup():
-    print("🚀 Backend starting...")
-    async def start_ws():
-        await asyncio.sleep(3)
-        await delta_ws_listener()
-
-    asyncio.create_task(start_ws())
+    print("🚀 Backend starting (Ultra Realtime)...")
+    asyncio.create_task(delta_ws_listener())
 
 # ===============================
-# FLUTTER WEBSOCKET
+# FLUTTER WS (INSTANT PUSH)
 # ===============================
 @app.websocket("/ws/tickers")
 async def flutter_ws(ws: WebSocket):
     await ws.accept()
-    print("📱 Flutter client connected")
+    print("📱 Flutter connected")
+
     try:
         while True:
+            # ❌ NO sleep → push immediately
             await ws.send_json({"ticks": latest_ticks})
-            await asyncio.sleep(0.3)  # 🔥 faster update (300ms)
+            await asyncio.sleep(0.05)  # ~20 FPS (smooth like Delta)
     except Exception as e:
         print(f"📱 Flutter disconnected: {e}")
 
 # ===============================
-# REST ENDPOINTS (OPTIONAL)
+# REST (OPTIONAL)
 # ===============================
 @app.get("/ticker/{symbol}")
 def get_ticker(symbol: str):
     symbol = symbol.upper()
-    if symbol in latest_ticks:
-        return {"success": True, "data": latest_ticks[symbol]}
-    return {"success": False, "error": "Symbol not found"}
-
-@app.get("/tickers")
-def get_all_tickers():
-    return {
-        "success": True,
-        "data": latest_ticks,
-        "count": len(latest_ticks),
-    }
+    return latest_ticks.get(symbol, {})
