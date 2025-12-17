@@ -105,29 +105,41 @@ async def delta_ws_listener():
                         continue
 
                     # ✅ Process ticker data for any subscribed symbol
-                    symbol = data.get("symbol")
-                    if symbol in SYMBOLS:
-                        # Try different price fields in order of preference
-                        raw_price = (
-                            data.get("mark_price")      # Primary: mark price
-                            or data.get("spot_price")   # Fallback: spot price
-                            or data.get("close")        # Fallback: close price
-                        )
+                    # ✅ Process ticker data for any subscribed symbol
+symbol = data.get("symbol")
+if symbol in SYMBOLS:
+    # ✅ Delta App style price (LTP first)
+    ltp = data.get("close")
+    spot = data.get("spot_price")
+    mark = data.get("mark_price")
 
-                        if raw_price:
-                            price_float = float(raw_price)
-                            latest_ticks[symbol] = {
-                                "symbol": symbol,
-                                "price": price_float,
-                                "timestamp": datetime.utcnow().isoformat(),
-                                "open": float(data.get("open", 0)),
-                                "high": float(data.get("high", 0)),
-                                "low": float(data.get("low", 0)),
-                                "close": float(data.get("close", 0)),
-                                "volume": data.get("volume", 0),
-                                "mark_change_24h": data.get("mark_change_24h", "0"),
-                            }
-                            print(f"📊 {symbol}: ${price_float:,.2f}")
+    raw_price = ltp or spot or mark
+
+    if raw_price:
+        latest_ticks[symbol] = {
+            "symbol": symbol,
+
+            # 🔥 MAIN PRICE = LTP
+            "price": float(raw_price),
+            "ltp": float(ltp) if ltp else None,
+
+            # 🛡 Safety / info prices
+            "mark_price": float(mark) if mark else None,
+            "spot_price": float(spot) if spot else None,
+
+            # 📊 Extra useful fields
+            "open": float(data.get("open", 0)),
+            "high": float(data.get("high", 0)),
+            "low": float(data.get("low", 0)),
+            "close": float(ltp) if ltp else 0,
+            "volume": data.get("volume", 0),
+
+            # ⏱ Timestamp
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        print(f"📊 {symbol} LTP: ${float(raw_price):,.2f}")
+
 
         except websockets.exceptions.ConnectionClosed as e:
             is_connected = False
