@@ -58,8 +58,10 @@ async def delta_ws_listener():
                 async for message in ws:
                     msg = json.loads(message)
                     
+                    # Handle Subscription Confirmation
                     if msg.get("type") == "subscriptions":
                         is_delta_connected = True
+                        logger.info("📡 Delta subscription confirmed.")
                         continue
 
                     channel = msg.get("channel")
@@ -87,7 +89,7 @@ async def delta_ws_listener():
 
                         latest_ticks[symbol] = {
                             "symbol": symbol,
-                            "price": price,
+                            "price": price if price > 0 else None,
                             "ltp": float(ltp) if ltp else None,
                             "mark_price": float(mark) if mark else None,
                             "bid": float(bid) if bid else None,
@@ -164,8 +166,6 @@ async def market_data_stream(websocket: WebSocket):
                 "status": "connected" if is_delta_connected else "connecting"
             }
             await websocket.send_json(payload)
-            # 100ms update rate is fine for mobile, 
-            # adjust if battery consumption is too high on Flutter
             await asyncio.sleep(0.1) 
             
     except WebSocketDisconnect:
