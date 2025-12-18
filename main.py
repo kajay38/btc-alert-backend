@@ -37,12 +37,12 @@ MAX_TRADES = 20  # last 20 trades per symbol
 for s in SYMBOLS:
     latest_ticks[s] = {
         "symbol": s,
-        "price": 0.0,       # Smooth (UI)
-        "ltp": 0.0,         # Last trade
-        "mark_price": 0.0,
-        "bid": 0.0,
-        "ask": 0.0,
-        "timestamp": datetime.utcnow().isoformat(),
+        "price": None,
+        "ltp": None,
+        "mark_price": None,
+        "bid": None,
+        "ask": None,
+        "timestamp": None,
     }
     latest_trades[s] = []
 
