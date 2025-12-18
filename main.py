@@ -21,7 +21,7 @@ logger = logging.getLogger("DELTA")
 # ===============================
 # CONFIG (SOL Removed)
 # ===============================
-DELTA_WS_URL = "wss://socket.delta.exchange"
+DELTA_WS_URL = "wss://socket.india.delta.exchange"
 SYMBOLS = ["BTCUSD", "ETHUSD"]  # SOL removed as requested
 MAX_TRADES = 20
 
