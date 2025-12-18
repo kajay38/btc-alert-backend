@@ -19,10 +19,10 @@ logging.basicConfig(
 logger = logging.getLogger("DELTA")
 
 # ===============================
-# CONFIG (SOL Removed)
+# CONFIG
 # ===============================
-DELTA_WS_URL = "wss://socket.india.delta.exchange"
-SYMBOLS = ["BTCUSD", "ETHUSD"]  # SOL removed as requested
+DELTA_WS_URL = "wss://socket.india.delta.exchange"  # ✅ Fixed: Use India endpoint
+SYMBOLS = ["BTCUSD", "ETHUSD"]
 MAX_TRADES = 20
 
 # ===============================
@@ -61,10 +61,11 @@ async def broadcast():
     }
 
     disconnected = set()
-    for ws in active_clients:
+    for ws in list(active_clients):  # ✅ Create copy to avoid modification during iteration
         try:
             await ws.send_json(payload)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to send to client: {e}")
             disconnected.add(ws)
 
     for ws in disconnected:
@@ -78,7 +79,10 @@ async def delta_ws_listener():
 
     while True:
         try:
+            logger.info(f"🔄 Connecting to Delta Exchange: {DELTA_WS_URL}")
             async with websockets.connect(DELTA_WS_URL, ping_interval=20, ping_timeout=10) as ws:
+                logger.info("✅ Connected to Delta Exchange WebSocket")
+                
                 subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
@@ -89,6 +93,7 @@ async def delta_ws_listener():
                     },
                 }
                 await ws.send(json.dumps(subscribe_msg))
+                logger.info(f"📡 Subscribed to channels for symbols: {SYMBOLS}")
                 
                 async for message in ws:
                     try:
@@ -97,6 +102,7 @@ async def delta_ws_listener():
 
                         if msg_type == "subscriptions":
                             is_delta_connected = True
+                            logger.info(f"✅ Subscription confirmed: {msg.get('channels', [])}")
                             continue
 
                         symbol = msg.get("symbol")
@@ -108,8 +114,10 @@ async def delta_ws_listener():
                             best_bid = quotes.get("best_bid")
                             best_ask = quotes.get("best_ask")
                             close_price = msg.get("close")
+                            mark_price = msg.get("mark_price")
+                            spot_price = msg.get("spot_price")
 
-                            # Simple average for price
+                            # Calculate mid price
                             price = None
                             if best_bid and best_ask:
                                 price = (float(best_bid) + float(best_ask)) / 2
@@ -120,11 +128,16 @@ async def delta_ws_listener():
                                 "symbol": symbol,
                                 "price": price,
                                 "ltp": float(close_price) if close_price else None,
-                                "mark_price": float(msg.get("mark_price")) if msg.get("mark_price") else None,
+                                "mark_price": float(mark_price) if mark_price else None,  # ✅ Should work now
+                                "spot_price": float(spot_price) if spot_price else None,  # ✅ Added spot_price
                                 "bid": float(best_bid) if best_bid else None,
                                 "ask": float(best_ask) if best_ask else None,
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             }
+                            
+                            # ✅ Debug log to verify mark_price
+                            logger.debug(f"📊 {symbol} | Mark: {mark_price} | LTP: {close_price} | Bid/Ask: {best_bid}/{best_ask}")
+                            
                             await broadcast()
 
                         elif msg_type == "all_trades":
@@ -138,10 +151,17 @@ async def delta_ws_listener():
                             latest_trades[symbol] = latest_trades[symbol][:MAX_TRADES]
                             await broadcast()
 
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ JSON decode error: {e}")
                     except Exception as e:
-                        logger.error(f"Error: {e}")
+                        logger.error(f"❌ Message processing error: {e}", exc_info=True)
 
+        except websockets.exceptions.WebSocketException as e:
+            logger.error(f"❌ WebSocket connection error: {e}")
+            is_delta_connected = False
+            await asyncio.sleep(5)
         except Exception as e:
+            logger.error(f"❌ Unexpected error in delta_ws_listener: {e}", exc_info=True)
             is_delta_connected = False
             await asyncio.sleep(5)
 
@@ -156,16 +176,38 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/")
 async def health():
-    return {"status": "online", "delta": is_delta_connected}
+    return {
+        "status": "online",
+        "delta_connected": is_delta_connected,
+        "active_clients": len(active_clients),
+        "symbols": SYMBOLS
+    }
 
 @app.websocket("/ws/market")
 async def ws_market(websocket: WebSocket):
     await websocket.accept()
     active_clients.add(websocket)
+    logger.info(f"✅ New client connected. Total clients: {len(active_clients)}")
+    
+    # ✅ Send initial state immediately
     try:
-        while True: await websocket.receive_text()
+        initial_payload = {
+            "ticks": latest_ticks,
+            "trades": latest_trades,
+            "status": "connected" if is_delta_connected else "reconnecting",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        await websocket.send_json(initial_payload)
+        logger.info("📤 Sent initial data to new client")
+    except Exception as e:
+        logger.error(f"❌ Failed to send initial data: {e}")
+    
+    try:
+        while True:
+            await websocket.receive_text()
     except WebSocketDisconnect:
         active_clients.discard(websocket)
+        logger.info(f"❌ Client disconnected. Remaining clients: {len(active_clients)}")
 
 if __name__ == "__main__":
     import uvicorn
