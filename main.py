@@ -1,195 +1,184 @@
 import asyncio
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from typing import Dict, Any, List
 
 import websockets
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DeltaWS")
+
 # ===============================
-# APP SETUP
+# CONFIG & STATE
 # ===============================
-app = FastAPI(title="Delta Public Market WS Backend")
+DELTA_WS_URL = "wss://socket.delta.exchange"
+SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD"]
+MAX_TRADES = 20
+
+# Global stores
+latest_ticks: Dict[str, Dict[str, Any]] = {
+    s: {"symbol": s, "price": None, "ltp": None, "mark_price": None, "bid": None, "ask": None, "timestamp": None} 
+    for s in SYMBOLS
+}
+latest_trades: Dict[str, List[Dict[str, Any]]] = {s: [] for s in SYMBOLS}
+is_delta_connected = False
+
+# ===============================
+# DELTA WS LOGIC
+# ===============================
+async def delta_ws_listener():
+    global is_delta_connected
+    
+    while True:
+        try:
+            logger.info("🔄 Connecting to Delta Exchange WebSocket...")
+            async with websockets.connect(
+                DELTA_WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                
+                subscribe_msg = {
+                    "type": "subscribe",
+                    "payload": {
+                        "channels": [
+                            {"name": "v2/ticker", "symbols": SYMBOLS},
+                            {"name": "v2/trades", "symbols": SYMBOLS},
+                        ]
+                    },
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                logger.info("✅ Subscribed to Delta Channels")
+
+                async for message in ws:
+                    msg = json.loads(message)
+                    
+                    if msg.get("type") == "subscriptions":
+                        is_delta_connected = True
+                        continue
+
+                    channel = msg.get("channel")
+                    symbol = msg.get("symbol")
+                    data = msg.get("data")
+
+                    if not symbol or symbol not in SYMBOLS or not data:
+                        continue
+
+                    # --- TICKER UPDATE ---
+                    if channel == "v2/ticker":
+                        ltp = data.get("close")
+                        bid = data.get("best_bid")
+                        ask = data.get("best_ask")
+                        mark = data.get("mark_price")
+
+                        # Mid-price calculation for smooth UI
+                        try:
+                            if bid and ask:
+                                price = (float(bid) + float(ask)) / 2
+                            else:
+                                price = float(ltp or mark or 0)
+                        except (ValueError, TypeError):
+                            price = 0
+
+                        latest_ticks[symbol] = {
+                            "symbol": symbol,
+                            "price": price,
+                            "ltp": float(ltp) if ltp else None,
+                            "mark_price": float(mark) if mark else None,
+                            "bid": float(bid) if bid else None,
+                            "ask": float(ask) if ask else None,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+
+                    # --- TRADES UPDATE ---
+                    elif channel == "v2/trades":
+                        trade = {
+                            "price": data.get("price"),
+                            "size": data.get("size"),
+                            "side": data.get("side"),
+                            "timestamp": data.get("timestamp"),
+                        }
+                        # Atomic update to list
+                        trades_list = latest_trades[symbol]
+                        trades_list.insert(0, trade)
+                        latest_trades[symbol] = trades_list[:MAX_TRADES]
+
+        except Exception as e:
+            is_delta_connected = False
+            logger.error(f"❌ Delta WS Connection Lost: {e}")
+            await asyncio.sleep(5) # Wait before reconnecting
+
+# ===============================
+# FASTAPI LIFESPAN & APP
+# ===============================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Start background task
+    task = asyncio.create_task(delta_ws_listener())
+    yield
+    # Shutdown: Clean up
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        logger.info("Background task stopped")
+
+app = FastAPI(title="Delta Market Pro", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===============================
-# CONFIG
-# ===============================
-DELTA_WS_URL = "wss://socket.delta.exchange"
-SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD"]
-
-# ===============================
-# GLOBAL STATE
-# ===============================
-latest_ticks: Dict[str, Dict[str, Any]] = {}
-latest_trades: Dict[str, List[Dict[str, Any]]] = {}
-is_connected = False
-
-MAX_TRADES = 20
-
-# initialize with None (important)
-for s in SYMBOLS:
-    latest_ticks[s] = {
-        "symbol": s,
-        "price": None,
-        "ltp": None,
-        "mark_price": None,
-        "bid": None,
-        "ask": None,
-        "timestamp": None,
-    }
-    latest_trades[s] = []
-
-# ===============================
-# HEALTH CHECK
+# ENDPOINTS
 # ===============================
 @app.get("/")
-def home():
+async def health_check():
     return {
-        "status": "ok",
-        "service": "Delta Public Market WS",
+        "status": "online" if is_delta_connected else "reconnecting",
         "symbols": SYMBOLS,
+        "server_time": datetime.now(timezone.utc).isoformat()
     }
 
-# ===============================
-# DELTA WS LISTENER
-# ===============================
-async def delta_ws_listener():
-    global is_connected
-
-    while True:
-        try:
-            print("🔄 Connecting to Delta WebSocket...")
-            async with websockets.connect(
-                DELTA_WS_URL,
-                ping_interval=15,
-                ping_timeout=15,
-            ) as ws:
-
-                subscribe_msg = {
-                    "type": "subscribe",
-                    "payload": {
-                        "channels": [
-                            {
-                                "name": "v2/ticker",
-                                "symbols": SYMBOLS,
-                            },
-                            {
-                                "name": "v2/trades",
-                                "symbols": SYMBOLS,
-                            },
-                        ]
-                    },
-                }
-
-                await ws.send(json.dumps(subscribe_msg))
-                print("✅ Subscribed to ticker + trades")
-
-                async for message in ws:
-                    msg = json.loads(message)
-
-                    # subscription confirm
-                    if msg.get("type") == "subscriptions":
-                        is_connected = True
-                        continue
-
-                    channel = msg.get("channel")
-                    symbol = msg.get("symbol")
-                    payload = msg.get("data", {})
-
-                    if symbol not in SYMBOLS:
-                        continue
-
-                    # ===============================
-                    # TICKER DATA
-                    # ===============================
-                    if channel == "v2/ticker":
-                        ltp = payload.get("close")
-                        bid = payload.get("best_bid")
-                        ask = payload.get("best_ask")
-                        mark = payload.get("mark_price")
-
-                        # smooth price for UI
-                        if bid and ask:
-                            smooth_price = (float(bid) + float(ask)) / 2
-                        else:
-                            smooth_price = ltp or mark
-
-                        if not smooth_price:
-                            continue
-
-                        latest_ticks[symbol] = {
-                            "symbol": symbol,
-                            "price": float(smooth_price),
-                            "ltp": float(ltp) if ltp else None,
-                            "mark_price": float(mark) if mark else None,
-                            "bid": float(bid) if bid else None,
-                            "ask": float(ask) if ask else None,
-                            "timestamp": datetime.utcnow().isoformat(),
-                        }
-
-                    # ===============================
-                    # TRADES DATA
-                    # ===============================
-                    if channel == "v2/trades":
-                        trade = {
-                            "price": payload.get("price"),
-                            "size": payload.get("size"),
-                            "side": payload.get("side"),
-                            "timestamp": payload.get("timestamp"),
-                        }
-
-                        latest_trades[symbol].insert(0, trade)
-
-                        if len(latest_trades[symbol]) > MAX_TRADES:
-                            latest_trades[symbol].pop()
-
-        except Exception as e:
-            is_connected = False
-            print(f"❌ Delta WS error: {e}")
-            print("🔁 Reconnecting in 3 seconds...")
-            await asyncio.sleep(3)
-
-# ===============================
-# STARTUP
-# ===============================
-@app.on_event("startup")
-async def startup():
-    print("🚀 Backend starting (Public Market Data)...")
-    asyncio.create_task(delta_ws_listener())
-
-# ===============================
-# FLUTTER WEBSOCKET
-# ===============================
 @app.websocket("/ws/market")
-async def flutter_market_ws(ws: WebSocket):
-    await ws.accept()
-    print("📱 Flutter connected")
-
+async def market_data_stream(websocket: WebSocket):
+    await websocket.accept()
+    logger.info(f"📱 Client connected: {websocket.client}")
+    
     try:
         while True:
-            await ws.send_json({
+            # Send current snapshot of all symbols
+            payload = {
+                "type": "market_update",
                 "ticks": latest_ticks,
                 "trades": latest_trades,
-            })
-            await asyncio.sleep(0.1)  # fast updates
+                "status": "connected" if is_delta_connected else "connecting"
+            }
+            await websocket.send_json(payload)
+            # 100ms update rate is fine for mobile, 
+            # adjust if battery consumption is too high on Flutter
+            await asyncio.sleep(0.1) 
+            
+    except WebSocketDisconnect:
+        logger.info("📱 Client disconnected")
     except Exception as e:
-        print(f"📱 Flutter disconnected: {e}")
+        logger.error(f"📱 WebSocket Error: {e}")
 
-# ===============================
-# OPTIONAL REST
-# ===============================
 @app.get("/market/{symbol}")
-def get_market(symbol: str):
-    symbol = symbol.upper()
+async def get_symbol_data(symbol: str):
+    s = symbol.upper()
+    if s not in SYMBOLS:
+        return {"error": "Invalid symbol"}
     return {
-        "tick": latest_ticks.get(symbol),
-        "trades": latest_trades.get(symbol, []),
+        "tick": latest_ticks.get(s),
+        "recent_trades": latest_trades.get(s, [])
     }
