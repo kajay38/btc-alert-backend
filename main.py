@@ -39,8 +39,8 @@ async def delta_ws_listener():
             logger.info("🔄 Connecting to Delta Exchange WebSocket...")
             async with websockets.connect(
                 DELTA_WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=20, # Har 20 sec mein ping bhejega
+                ping_timeout=10,
             ) as ws:
                 
                 # Subscription Payload
@@ -59,7 +59,6 @@ async def delta_ws_listener():
                 async for message in ws:
                     msg = json.loads(message)
                     
-                    # Handle Subscription Confirmation
                     if msg.get("type") == "subscriptions":
                         is_delta_connected = True
                         logger.info("📡 Delta subscription active.")
@@ -72,7 +71,6 @@ async def delta_ws_listener():
                     if not symbol or symbol not in SYMBOLS or not data:
                         continue
 
-                    # --- TICKER UPDATE ---
                     if channel == "v2/ticker":
                         ltp = data.get("close")
                         bid = data.get("best_bid")
@@ -80,12 +78,10 @@ async def delta_ws_listener():
                         mark = data.get("mark_price")
 
                         try:
-                            # Price logic: Prefer mid-price, then LTP, then Mark
                             if bid and ask:
                                 price = (float(bid) + float(ask)) / 2
                             else:
                                 price = float(ltp or mark or 0)
-                            
                             if price <= 0: price = None
                         except (ValueError, TypeError):
                             price = None
@@ -100,7 +96,6 @@ async def delta_ws_listener():
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
 
-                    # --- TRADES UPDATE ---
                     elif channel == "v2/trades":
                         trade = {
                             "price": data.get("price"),
@@ -114,7 +109,7 @@ async def delta_ws_listener():
         except Exception as e:
             is_delta_connected = False
             logger.error(f"❌ Delta WS Error: {e}")
-            await asyncio.sleep(5) 
+            await asyncio.sleep(3) # Retry after 3 seconds
 
 # ===============================
 # APP SETUP
@@ -137,24 +132,29 @@ app.add_middleware(
 
 @app.get("/")
 async def health():
-    return {"status": "online" if is_delta_connected else "reconnecting", "symbols": SYMBOLS}
+    return {
+        "status": "online" if is_delta_connected else "reconnecting", 
+        "symbols": SYMBOLS,
+        "delta_connected": is_delta_connected
+    }
 
 @app.websocket("/ws/market")
 async def market_data_stream(websocket: WebSocket):
     await websocket.accept()
-    logger.info("📱 Flutter Client connected")
+    logger.info(f"📱 Client connected: {websocket.client}")
     try:
         while True:
+            # Check if socket is still open before sending
             await websocket.send_json({
                 "ticks": latest_ticks,
                 "trades": latest_trades,
                 "status": "connected" if is_delta_connected else "connecting"
             })
-            await asyncio.sleep(0.1) 
+            await asyncio.sleep(0.2) # Thoda delay badhaya hai for stability
     except WebSocketDisconnect:
-        logger.info("📱 Flutter Client disconnected")
+        logger.info("📱 Client disconnected gracefully")
     except Exception as e:
-        logger.error(f"📱 WS Error: {e}")
+        logger.error(f"📱 WS Runtime Error: {e}")
 
 @app.get("/market/{symbol}")
 async def get_symbol_data(symbol: str):
