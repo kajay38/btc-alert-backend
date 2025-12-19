@@ -25,13 +25,21 @@ logger = logging.getLogger("DELTA-BACKEND")
 # CONFIG
 # ===============================
 DELTA_WS_URL = "wss://socket.india.delta.exchange"
-SYMBOLS = ["BTCUSD"]
+SYMBOLS = ["BTCUSD", "ETHUSD"]
 
 # ===============================
 # GLOBAL STATE
 # ===============================
 latest_ticks: Dict[str, Dict[str, Any]] = {
-    s: {"symbol": s, "price": None, "timestamp": None}
+    s: {
+        "symbol": s,
+        "price": None,        # calculated display price
+        "mark_price": None,
+        "ltp": None,
+        "bid": None,
+        "ask": None,
+        "timestamp": None,
+    }
     for s in SYMBOLS
 }
 
@@ -39,7 +47,7 @@ active_clients: Set[WebSocket] = set()
 is_delta_connected = False
 
 # ===============================
-# FIRESTORE (SAFE MODE)
+# FIRESTORE (OPTIONAL / SAFE)
 # ===============================
 db = None
 
@@ -65,7 +73,7 @@ def init_firestore():
         db = None
 
 # ===============================
-# ALERT MODEL
+# ALERT MODEL (FOR LATER USE)
 # ===============================
 class AlertCreate(BaseModel):
     symbol: str
@@ -89,7 +97,7 @@ async def delta_ws_listener():
                 ping_timeout=10,
             ) as ws:
 
-                sub_msg = {
+                subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
@@ -98,7 +106,7 @@ async def delta_ws_listener():
                     },
                 }
 
-                await ws.send(json.dumps(sub_msg))
+                await ws.send(json.dumps(subscribe_msg))
                 is_delta_connected = True
                 logger.info("✅ Delta WS connected")
 
@@ -110,19 +118,45 @@ async def delta_ws_listener():
                     if symbol not in SYMBOLS:
                         continue
 
-                    raw_price = (
-                        data.get("mark_price")
-                        or data.get("spot_price")
-                        or data.get("close")
+                    # ---------------------------
+                    # RAW FIELDS FROM DELTA
+                    # ---------------------------
+                    mark_price = data.get("mark_price")
+                    ltp = data.get("close")           # last traded price
+                    quotes = data.get("quotes") or {}
+                    bid = quotes.get("best_bid")
+                    ask = quotes.get("best_ask")
+
+                    # ---------------------------
+                    # CALCULATED DISPLAY PRICE
+                    # ---------------------------
+                    display_price = None
+                    if bid and ask:
+                        display_price = (float(bid) + float(ask)) / 2
+                    elif mark_price:
+                        display_price = float(mark_price)
+                    elif ltp:
+                        display_price = float(ltp)
+
+                    # ---------------------------
+                    # UPDATE GLOBAL STATE
+                    # ---------------------------
+                    latest_ticks[symbol] = {
+                        "symbol": symbol,
+                        "price": display_price,
+                        "mark_price": float(mark_price) if mark_price else None,
+                        "ltp": float(ltp) if ltp else None,
+                        "bid": float(bid) if bid else None,
+                        "ask": float(ask) if ask else None,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+
+                    logger.info(
+                        f"📊 {symbol} | price={display_price} "
+                        f"mark={mark_price} ltp={ltp} bid/ask={bid}/{ask}"
                     )
 
-                    if raw_price:
-                        latest_ticks[symbol] = {
-                            "symbol": symbol,
-                            "price": float(raw_price),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                        await broadcast()
+                    await broadcast()
 
         except Exception as e:
             is_delta_connected = False
@@ -130,7 +164,7 @@ async def delta_ws_listener():
             await asyncio.sleep(5)
 
 # ===============================
-# BROADCAST TO FLUTTER
+# BROADCAST TO FLUTTER CLIENTS
 # ===============================
 async def broadcast():
     if not active_clients:
@@ -167,7 +201,7 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
 
-app = FastAPI(title="BTC Delta Alerts Backend", lifespan=lifespan)
+app = FastAPI(title="BTC Delta Market Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,66 +219,8 @@ def root():
         "status": "up",
         "delta_ws": "connected" if is_delta_connected else "disconnected",
         "symbols": SYMBOLS,
+        "sample": latest_ticks,
     }
-
-# ===============================
-# ALERT APIs (SAFE)
-# ===============================
-@app.post("/alerts")
-def create_alert(alert: AlertCreate):
-    if db is None:
-        return {"error": "Firestore not connected"}
-
-    doc = {
-        "symbol": alert.symbol,
-        "type": alert.type,
-        "from_price": alert.from_price,
-        "to_price": alert.to_price,
-        "note": alert.note,
-        "active": True,
-        "triggered": False,
-        "created_at": datetime.utcnow(),
-    }
-
-    ref = db.collection("alerts").add(doc)
-    return {"status": "saved", "id": ref[1].id}
-
-@app.get("/alerts")
-def read_alerts():
-    if db is None:
-        return {"alerts": []}
-
-    alerts = []
-    docs = db.collection("alerts").order_by(
-        "created_at", direction=db.Query.DESCENDING
-    ).stream()
-
-    for d in docs:
-        data = d.to_dict()
-        data["id"] = d.id
-        alerts.append(data)
-
-    return {"alerts": alerts}
-
-@app.get("/alerts/active")
-def read_active_alerts():
-    if db is None:
-        return {"alerts": []}
-
-    alerts = []
-    docs = (
-        db.collection("alerts")
-        .where("active", "==", True)
-        .where("triggered", "==", False)
-        .stream()
-    )
-
-    for d in docs:
-        data = d.to_dict()
-        data["id"] = d.id
-        alerts.append(data)
-
-    return {"alerts": alerts}
 
 # ===============================
 # FLUTTER WEBSOCKET
@@ -257,7 +233,7 @@ async def ws_market(ws: WebSocket):
 
     try:
         while True:
-            await ws.receive_text()
+            await ws.receive_text()  # keep alive
     except WebSocketDisconnect:
         active_clients.discard(ws)
         logger.info(f"📱 Flutter client disconnected ({len(active_clients)})")
