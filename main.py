@@ -4,12 +4,10 @@ import os
 import base64
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, Optional, Set
 from contextlib import asynccontextmanager
 
 import websockets
-import firebase_admin
-from firebase_admin import credentials, firestore
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,8 +15,11 @@ from pydantic import BaseModel
 # ===============================
 # LOGGING
 # ===============================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("BACKEND")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("DELTA-BACKEND")
 
 # ===============================
 # CONFIG
@@ -30,11 +31,7 @@ SYMBOLS = ["BTCUSD"]
 # GLOBAL STATE
 # ===============================
 latest_ticks: Dict[str, Dict[str, Any]] = {
-    s: {
-        "symbol": s,
-        "price": None,
-        "timestamp": None,
-    }
+    s: {"symbol": s, "price": None, "timestamp": None}
     for s in SYMBOLS
 }
 
@@ -42,25 +39,30 @@ active_clients: Set[WebSocket] = set()
 is_delta_connected = False
 
 # ===============================
-# FIRESTORE INIT
+# FIRESTORE (SAFE MODE)
 # ===============================
-firebase_app = None
 db = None
 
 def init_firestore():
-    global firebase_app, db
-    if firebase_app:
-        return
+    global db
+    try:
+        key_b64 = os.environ.get("FIREBASE_KEY_BASE64")
+        if not key_b64:
+            logger.warning("⚠️ FIREBASE_KEY_BASE64 not set → Firestore disabled")
+            return
 
-    key_b64 = os.environ.get("FIREBASE_KEY_BASE64")
-    if not key_b64:
-        raise RuntimeError("FIREBASE_KEY_BASE64 not set")
+        import firebase_admin
+        from firebase_admin import credentials, firestore
 
-    key_json = base64.b64decode(key_b64).decode("utf-8")
-    cred = credentials.Certificate(json.loads(key_json))
-    firebase_app = firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logger.info("🔥 Firestore connected")
+        key_json = base64.b64decode(key_b64).decode("utf-8")
+        cred = credentials.Certificate(json.loads(key_json))
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("🔥 Firestore connected")
+
+    except Exception as e:
+        logger.error(f"❌ Firestore init failed: {e}")
+        db = None
 
 # ===============================
 # ALERT MODEL
@@ -73,21 +75,21 @@ class AlertCreate(BaseModel):
     note: str
 
 # ===============================
-# DELTA WEBSOCKET
+# DELTA WEBSOCKET LISTENER
 # ===============================
 async def delta_ws_listener():
     global is_delta_connected
 
     while True:
         try:
-            logger.info("🔄 Connecting to Delta WS...")
+            logger.info("🔄 Connecting to Delta WebSocket...")
             async with websockets.connect(
                 DELTA_WS_URL,
                 ping_interval=20,
                 ping_timeout=10,
             ) as ws:
 
-                subscribe_msg = {
+                sub_msg = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
@@ -96,7 +98,7 @@ async def delta_ws_listener():
                     },
                 }
 
-                await ws.send(json.dumps(subscribe_msg))
+                await ws.send(json.dumps(sub_msg))
                 is_delta_connected = True
                 logger.info("✅ Delta WS connected")
 
@@ -120,7 +122,6 @@ async def delta_ws_listener():
                             "price": float(raw_price),
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
-
                         await broadcast()
 
         except Exception as e:
@@ -152,16 +153,21 @@ async def broadcast():
         active_clients.discard(ws)
 
 # ===============================
-# FASTAPI APP (Railway-Safe)
+# FASTAPI APP (RAILWAY SAFE)
 # ===============================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_firestore()
-    task = asyncio.create_task(delta_ws_listener())
+
+    async def start_ws():
+        await asyncio.sleep(3)  # Railway health check safe
+        await delta_ws_listener()
+
+    task = asyncio.create_task(start_ws())
     yield
     task.cancel()
 
-app = FastAPI(title="Delta Alerts Backend", lifespan=lifespan)
+app = FastAPI(title="BTC Delta Alerts Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -171,7 +177,7 @@ app.add_middleware(
 )
 
 # ===============================
-# HEALTH
+# HEALTH CHECK
 # ===============================
 @app.get("/")
 def root():
@@ -182,10 +188,13 @@ def root():
     }
 
 # ===============================
-# ALERTS APIs
+# ALERT APIs (SAFE)
 # ===============================
 @app.post("/alerts")
 def create_alert(alert: AlertCreate):
+    if db is None:
+        return {"error": "Firestore not connected"}
+
     doc = {
         "symbol": alert.symbol,
         "type": alert.type,
@@ -196,14 +205,66 @@ def create_alert(alert: AlertCreate):
         "triggered": False,
         "created_at": datetime.utcnow(),
     }
+
     ref = db.collection("alerts").add(doc)
     return {"status": "saved", "id": ref[1].id}
 
 @app.get("/alerts")
 def read_alerts():
+    if db is None:
+        return {"alerts": []}
+
     alerts = []
     docs = db.collection("alerts").order_by(
-        "created_at", direction=firestore.Query.DESCENDING
+        "created_at", direction=db.Query.DESCENDING
     ).stream()
 
-    for d in d
+    for d in docs:
+        data = d.to_dict()
+        data["id"] = d.id
+        alerts.append(data)
+
+    return {"alerts": alerts}
+
+@app.get("/alerts/active")
+def read_active_alerts():
+    if db is None:
+        return {"alerts": []}
+
+    alerts = []
+    docs = (
+        db.collection("alerts")
+        .where("active", "==", True)
+        .where("triggered", "==", False)
+        .stream()
+    )
+
+    for d in docs:
+        data = d.to_dict()
+        data["id"] = d.id
+        alerts.append(data)
+
+    return {"alerts": alerts}
+
+# ===============================
+# FLUTTER WEBSOCKET
+# ===============================
+@app.websocket("/ws/market")
+async def ws_market(ws: WebSocket):
+    await ws.accept()
+    active_clients.add(ws)
+    logger.info(f"📱 Flutter client connected ({len(active_clients)})")
+
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        active_clients.discard(ws)
+        logger.info(f"📱 Flutter client disconnected ({len(active_clients)})")
+
+# ===============================
+# LOCAL RUN
+# ===============================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
