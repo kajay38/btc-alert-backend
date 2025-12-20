@@ -3,6 +3,7 @@ import json
 import os
 import base64
 import logging
+import signal
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Set
 from contextlib import asynccontextmanager
@@ -62,6 +63,7 @@ latest_ticks: Dict[str, Dict[str, Any]] = {
 
 active_clients: Set[WebSocket] = set()
 is_delta_connected = False
+shutdown_event = asyncio.Event()
 
 # ✅ Analysis Worker (with error handling)
 analysis_worker = None
@@ -83,6 +85,7 @@ if ANALYSIS_ENABLED:
 db = None
 
 def init_firestore():
+    """Initialize Firestore connection"""
     global db
     try:
         key_b64 = os.environ.get("FIREBASE_KEY_BASE64")
@@ -104,17 +107,20 @@ def init_firestore():
         db = None
 
 # ===============================
-# DELTA WEBSOCKET LISTENER
+# DELTA WEBSOCKET LISTENER (FIXED)
 # ===============================
 async def delta_ws_listener():
+    """
+    Connects to Delta Exchange WebSocket and streams market data.
+    Automatically reconnects on disconnection with infinite retries.
+    """
     global is_delta_connected
     
-    retry_count = 0
-    max_retries = 5
-
-    while retry_count < max_retries:
+    reconnect_delay = 5  # seconds
+    
+    while not shutdown_event.is_set():
         try:
-            logger.info(f"🔄 Connecting to Delta WebSocket (attempt {retry_count + 1}/{max_retries})...")
+            logger.info(f"🔄 Connecting to Delta WebSocket...")
             
             async with websockets.connect(
                 DELTA_WS_URL,
@@ -123,6 +129,7 @@ async def delta_ws_listener():
                 close_timeout=10,
             ) as ws:
 
+                # Subscribe to ticker channels
                 subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
@@ -134,15 +141,17 @@ async def delta_ws_listener():
 
                 await ws.send(json.dumps(subscribe_msg))
                 is_delta_connected = True
-                retry_count = 0  # Reset on successful connection
-                logger.info("✅ Delta WS connected")
+                logger.info("✅ Delta WS connected and subscribed")
 
+                # Listen for messages
                 async for msg in ws:
+                    if shutdown_event.is_set():
+                        break
+                        
                     try:
-                        await asyncio.sleep(0)
                         data = json.loads(msg)
-
                         symbol = data.get("symbol")
+                        
                         if symbol not in SYMBOLS:
                             continue
 
@@ -203,6 +212,7 @@ async def delta_ws_listener():
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
 
+                        # Broadcast to all connected clients
                         await broadcast()
                         
                     except json.JSONDecodeError:
@@ -212,24 +222,36 @@ async def delta_ws_listener():
                         logger.error(f"❌ Error processing message: {e}")
                         continue
 
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as e:
             is_delta_connected = False
-            retry_count += 1
-            logger.warning(f"⚠️ Delta WS connection closed, retrying in 5s...")
-            await asyncio.sleep(5)
+            logger.warning(f"⚠️ Delta WS connection closed: {e}")
+            
+        except websockets.exceptions.WebSocketException as e:
+            is_delta_connected = False
+            logger.error(f"❌ Delta WS error: {e}")
             
         except Exception as e:
             is_delta_connected = False
-            retry_count += 1
-            logger.error(f"❌ Delta WS error: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"❌ Unexpected error in Delta WS: {e}")
+        
+        # Wait before reconnecting (unless shutting down)
+        if not shutdown_event.is_set():
+            logger.info(f"🔄 Reconnecting in {reconnect_delay} seconds...")
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), 
+                    timeout=reconnect_delay
+                )
+            except asyncio.TimeoutError:
+                pass  # Continue to reconnect
     
-    logger.error("❌ Max retries reached. WebSocket listener stopped.")
+    logger.info("🛑 Delta WS listener stopped")
 
 # ===============================
 # BROADCAST TO CLIENTS
 # ===============================
 async def broadcast():
+    """Broadcast market data to all connected WebSocket clients"""
     if not active_clients:
         return
 
@@ -252,18 +274,32 @@ async def broadcast():
     for ws in active_clients:
         try:
             await ws.send_json(payload)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to send to client: {e}")
             dead.add(ws)
 
+    # Remove dead connections
     for ws in dead:
         active_clients.discard(ws)
 
 # ===============================
-# FASTAPI SETUP
+# GRACEFUL SHUTDOWN HANDLER
+# ===============================
+def handle_shutdown(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info(f"🛑 Received shutdown signal: {signum}")
+    shutdown_event.set()
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+# ===============================
+# FASTAPI SETUP (FIXED LIFESPAN)
 # ===============================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
+    """Application lifespan manager with proper cleanup"""
     logger.info("🚀 Starting application...")
     
     # Initialize Firestore
@@ -285,17 +321,52 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup
+    # ===============================
+    # CLEANUP ON SHUTDOWN
+    # ===============================
     logger.info("🛑 Shutting down application...")
-    ws_task.cancel()
-    if analysis_task:
+    
+    # Signal shutdown to all tasks
+    shutdown_event.set()
+    
+    # Cancel WebSocket task
+    if ws_task and not ws_task.done():
+        ws_task.cancel()
+        try:
+            await asyncio.wait_for(ws_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            logger.info("✅ WebSocket task cancelled")
+    
+    # Cancel Analysis task
+    if analysis_task and not analysis_task.done():
         analysis_task.cancel()
+        try:
+            await asyncio.wait_for(analysis_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            logger.info("✅ Analysis task cancelled")
+    
+    # Stop analysis worker
     if analysis_worker:
-        analysis_worker.stop()
-    logger.info("✅ Application stopped")
+        try:
+            analysis_worker.stop()
+            logger.info("✅ Analysis worker stopped")
+        except Exception as e:
+            logger.error(f"❌ Error stopping analysis worker: {e}")
+    
+    # Close all WebSocket connections
+    for ws in list(active_clients):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    active_clients.clear()
+    
+    logger.info("✅ Application stopped gracefully")
 
 app = FastAPI(
     title="Delta Advanced Market API",
+    description="Real-time market data from Delta Exchange with technical indicators",
+    version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -304,6 +375,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -313,12 +385,14 @@ app.add_middleware(
 # ===============================
 @app.get("/health")
 def health_check():
-    """Health check endpoint for Railway"""
+    """Health check endpoint for Railway and monitoring"""
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "websocket_connected": is_delta_connected,
         "analysis_enabled": ANALYSIS_ENABLED,
+        "active_clients": len(active_clients),
+        "symbols": SYMBOLS,
     }
 
 # ===============================
@@ -326,6 +400,7 @@ def health_check():
 # ===============================
 @app.get("/")
 def root():
+    """Get current market data and indicators"""
     indicators_data = {}
     if ANALYSIS_ENABLED and analysis_worker:
         try:
@@ -340,6 +415,28 @@ def root():
         "indicators": indicators_data,
         "websocket_connected": is_delta_connected,
         "analysis_enabled": ANALYSIS_ENABLED,
+        "active_clients": len(active_clients),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+# ===============================
+# MARKET DATA ENDPOINTS
+# ===============================
+@app.get("/market/{symbol}")
+def get_market_data(symbol: str):
+    """Get market data for a specific symbol"""
+    symbol = symbol.upper()
+    
+    if symbol not in SYMBOLS:
+        return {
+            "status": "error",
+            "message": f"Symbol {symbol} not found. Available symbols: {', '.join(SYMBOLS)}"
+        }
+    
+    return {
+        "status": "success",
+        "data": latest_ticks.get(symbol),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 # ===============================
@@ -358,6 +455,7 @@ def get_indicators():
         return {
             "status": "success",
             "data": analysis_worker.get_all_indicators(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         logger.error(f"Error in /indicators: {e}")
@@ -369,6 +467,8 @@ def get_indicators():
 @app.get("/indicators/{symbol}")
 def get_symbol_indicators(symbol: str):
     """Get EMA and MA indicators for a specific symbol"""
+    symbol = symbol.upper()
+    
     if not ANALYSIS_ENABLED or not analysis_worker:
         return {
             "status": "disabled",
@@ -376,16 +476,23 @@ def get_symbol_indicators(symbol: str):
         }
     
     if symbol not in SYMBOLS:
-        return {"status": "error", "message": f"Symbol {symbol} not found"}
+        return {
+            "status": "error",
+            "message": f"Symbol {symbol} not found. Available symbols: {', '.join(SYMBOLS)}"
+        }
     
     try:
         data = analysis_worker.get_indicators(symbol)
         if not data:
-            return {"status": "error", "message": "Indicators not yet calculated"}
+            return {
+                "status": "error",
+                "message": "Indicators not yet calculated. Please wait a few moments."
+            }
         
         return {
             "status": "success",
             "data": data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         logger.error(f"Error in /indicators/{symbol}: {e}")
@@ -399,19 +506,34 @@ def get_symbol_indicators(symbol: str):
 # ===============================
 @app.websocket("/ws/market")
 async def ws_market(ws: WebSocket):
+    """WebSocket endpoint for real-time market data streaming"""
     await ws.accept()
     active_clients.add(ws)
     logger.info(f"✅ Client connected. Total clients: {len(active_clients)}")
     
     try:
+        # Send initial data immediately
+        await broadcast()
+        
+        # Keep connection alive and listen for client messages
         while True:
-            await ws.receive_text()
+            try:
+                # Wait for client messages (ping/pong or commands)
+                await asyncio.wait_for(ws.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+                    
     except WebSocketDisconnect:
-        active_clients.discard(ws)
-        logger.info(f"❌ Client disconnected. Total clients: {len(active_clients)}")
+        logger.info(f"❌ Client disconnected gracefully")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"❌ WebSocket error: {e}")
+    finally:
         active_clients.discard(ws)
+        logger.info(f"📊 Total clients: {len(active_clients)}")
 
 # ===============================
 # RUN SERVER
@@ -427,4 +549,5 @@ if __name__ == "__main__":
         port=PORT,
         log_level="info",
         access_log=True,
+        timeout_keep_alive=75,
     )
