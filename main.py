@@ -12,6 +12,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# ✅ NEW IMPORTS
+from analysis_worker import AnalysisWorker
+
 # ===============================
 # LOGGING (Backend monitoring ke liye)
 # ===============================
@@ -33,17 +36,17 @@ SYMBOLS = ["BTCUSD", "ETHUSD"]
 latest_ticks: Dict[str, Dict[str, Any]] = {
     s: {
         "symbol": s,
-        "price": None,            # Current Display Price
+        "price": None,
         "mark_price": None,
-        "ltp": None,              # Last Traded Price (Close)
-        "open_24h": None,         # 24 ghante pehle ka price
-        "high_24h": None,         # Aaj ka High
-        "low_24h": None,          # Aaj ka Low
-        "volume_24h": None,       # Trading Volume
-        "change_percent": 0.0,    # Kitne percent up/down hai
+        "ltp": None,
+        "open_24h": None,
+        "high_24h": None,
+        "low_24h": None,
+        "volume_24h": None,
+        "change_percent": 0.0,
         "bid": None,
         "ask": None,
-        "spread": None,           # Bid aur Ask ka difference
+        "spread": None,
         "timestamp": None,
     }
     for s in SYMBOLS
@@ -51,6 +54,13 @@ latest_ticks: Dict[str, Dict[str, Any]] = {
 
 active_clients: Set[WebSocket] = set()
 is_delta_connected = False
+
+# ✅ NEW: Analysis Worker Instance
+analysis_worker = AnalysisWorker(
+    symbols=SYMBOLS,
+    resolution="1h",      # 1 hour timeframe
+    update_interval=300   # Update every 5 minutes
+)
 
 # ===============================
 # FIRESTORE (Agar use karna ho toh)
@@ -110,29 +120,23 @@ async def delta_ws_listener():
                     await asyncio.sleep(0)
                     data = json.loads(msg)
 
-                    # Basic validation
                     symbol = data.get("symbol")
                     if symbol not in SYMBOLS:
                         continue
 
-                    # ---------------------------
-                    # RAW DATA EXTRACTION (FIXED FIELD NAMES)
-                    # ---------------------------
+                    # RAW DATA EXTRACTION
                     mark_price = data.get("mark_price")
-                    ltp = data.get("close")               # Current price (Last Traded Price)
-                    open_24h = data.get("open")           # ✅ FIXED: was "open_24h"
-                    high_24h = data.get("high")           # ✅ FIXED: was "high_24h"
-                    low_24h = data.get("low")             # ✅ FIXED: was "low_24h"
-                    volume_24h = data.get("volume")       # ✅ FIXED: was "volume_24h"
+                    ltp = data.get("close")
+                    open_24h = data.get("open")
+                    high_24h = data.get("high")
+                    low_24h = data.get("low")
+                    volume_24h = data.get("volume")
                     
                     quotes = data.get("quotes") or {}
                     bid = quotes.get("best_bid")
                     ask = quotes.get("best_ask")
 
-                    # ---------------------------
                     # CALCULATIONS
-                    # ---------------------------
-                    # 1. Display Price (Priority: LTP > Mid of Bid/Ask)
                     display_price = None
                     if ltp:
                         display_price = float(ltp)
@@ -143,7 +147,6 @@ async def delta_ws_listener():
                     else:
                         display_price = 0.0
                     
-                    # 2. Percentage Change (24h)
                     change_pct = 0.0
                     if open_24h and ltp:
                         try:
@@ -154,7 +157,6 @@ async def delta_ws_listener():
                         except (ValueError, ZeroDivisionError):
                             change_pct = 0.0
 
-                    # 3. Spread (Bid-Ask difference)
                     spread = 0.0
                     if bid and ask:
                         try:
@@ -162,9 +164,7 @@ async def delta_ws_listener():
                         except ValueError:
                             spread = 0.0
 
-                    # ---------------------------
                     # UPDATE GLOBAL STATE
-                    # ---------------------------
                     latest_ticks[symbol] = {
                         "symbol": symbol,
                         "price": round(display_price, 2) if display_price else None,
@@ -180,13 +180,6 @@ async def delta_ws_listener():
                         "spread": round(spread, 4) if spread else None,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
-
-                    # Log for debugging
-                    logger.info(
-                        f"📊 {symbol} | Price: {display_price:.2f} | "
-                        f"Open: {open_24h} | High: {high_24h} | Low: {low_24h} | "
-                        f"Vol: {volume_24h} | Chg: {change_pct:.2f}%"
-                    )
 
                     await broadcast()
 
@@ -206,9 +199,13 @@ async def broadcast():
     if not active_clients:
         return
 
+    # ✅ NEW: Include indicators data in broadcast
+    indicators_data = analysis_worker.get_all_indicators()
+
     payload = {
         "status": "connected" if is_delta_connected else "reconnecting",
         "ticks": latest_ticks,
+        "indicators": indicators_data,  # ✅ EMA/MA data added
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -228,12 +225,22 @@ async def broadcast():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_firestore()
+    
+    # Start Delta WebSocket
     async def start_ws():
         await asyncio.sleep(2) 
         await delta_ws_listener()
-    task = asyncio.create_task(start_ws())
+    ws_task = asyncio.create_task(start_ws())
+    
+    # ✅ NEW: Start Analysis Worker
+    analysis_task = asyncio.create_task(analysis_worker.start())
+    
     yield
-    task.cancel()
+    
+    # Cleanup
+    ws_task.cancel()
+    analysis_task.cancel()
+    analysis_worker.stop()
 
 app = FastAPI(title="Delta Advanced Market API", lifespan=lifespan)
 
@@ -250,6 +257,32 @@ def root():
         "status": "up",
         "symbols": SYMBOLS,
         "data": latest_ticks,
+        "indicators": analysis_worker.get_all_indicators(),  # ✅ NEW
+    }
+
+# ✅ NEW: Dedicated endpoint for indicators
+@app.get("/indicators")
+def get_indicators():
+    """Get EMA and MA indicators for all symbols"""
+    return {
+        "status": "success",
+        "data": analysis_worker.get_all_indicators(),
+    }
+
+# ✅ NEW: Get indicators for specific symbol
+@app.get("/indicators/{symbol}")
+def get_symbol_indicators(symbol: str):
+    """Get EMA and MA indicators for a specific symbol"""
+    if symbol not in SYMBOLS:
+        return {"status": "error", "message": f"Symbol {symbol} not found"}
+    
+    data = analysis_worker.get_indicators(symbol)
+    if not data:
+        return {"status": "error", "message": "Indicators not yet calculated"}
+    
+    return {
+        "status": "success",
+        "data": data,
     }
 
 @app.websocket("/ws/market")
