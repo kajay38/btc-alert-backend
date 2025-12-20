@@ -116,14 +116,14 @@ async def delta_ws_listener():
                         continue
 
                     # ---------------------------
-                    # RAW DATA EXTRACTION
+                    # RAW DATA EXTRACTION (FIXED FIELD NAMES)
                     # ---------------------------
                     mark_price = data.get("mark_price")
-                    ltp = data.get("close")               # Current price
-                    open_24h = data.get("open_24h")
-                    high_24h = data.get("high_24h")
-                    low_24h = data.get("low_24h")
-                    volume_24h = data.get("volume_24h")
+                    ltp = data.get("close")               # Current price (Last Traded Price)
+                    open_24h = data.get("open")           # ✅ FIXED: was "open_24h"
+                    high_24h = data.get("high")           # ✅ FIXED: was "high_24h"
+                    low_24h = data.get("low")             # ✅ FIXED: was "low_24h"
+                    volume_24h = data.get("volume")       # ✅ FIXED: was "volume_24h"
                     
                     quotes = data.get("quotes") or {}
                     bid = quotes.get("best_bid")
@@ -132,30 +132,42 @@ async def delta_ws_listener():
                     # ---------------------------
                     # CALCULATIONS
                     # ---------------------------
-                    # 1. Display Price (Mid of Bid/Ask)
-                    display_price = float(ltp) if ltp else 0.0
-                    if bid and ask:
+                    # 1. Display Price (Priority: LTP > Mid of Bid/Ask)
+                    display_price = None
+                    if ltp:
+                        display_price = float(ltp)
+                    elif bid and ask:
                         display_price = (float(bid) + float(ask)) / 2
+                    elif mark_price:
+                        display_price = float(mark_price)
+                    else:
+                        display_price = 0.0
                     
-                    # 2. Percentage Change
+                    # 2. Percentage Change (24h)
                     change_pct = 0.0
                     if open_24h and ltp:
-                        o = float(open_24h)
-                        c = float(ltp)
-                        if o > 0:
-                            change_pct = ((c - o) / o) * 100
+                        try:
+                            o = float(open_24h)
+                            c = float(ltp)
+                            if o > 0:
+                                change_pct = ((c - o) / o) * 100
+                        except (ValueError, ZeroDivisionError):
+                            change_pct = 0.0
 
-                    # 3. Spread
+                    # 3. Spread (Bid-Ask difference)
                     spread = 0.0
                     if bid and ask:
-                        spread = float(ask) - float(bid)
+                        try:
+                            spread = float(ask) - float(bid)
+                        except ValueError:
+                            spread = 0.0
 
                     # ---------------------------
                     # UPDATE GLOBAL STATE
                     # ---------------------------
                     latest_ticks[symbol] = {
                         "symbol": symbol,
-                        "price": round(display_price, 2),
+                        "price": round(display_price, 2) if display_price else None,
                         "mark_price": float(mark_price) if mark_price else None,
                         "ltp": float(ltp) if ltp else None,
                         "open_24h": float(open_24h) if open_24h else None,
@@ -165,18 +177,23 @@ async def delta_ws_listener():
                         "change_percent": round(change_pct, 2),
                         "bid": float(bid) if bid else None,
                         "ask": float(ask) if ask else None,
-                        "spread": round(spread, 4),
+                        "spread": round(spread, 4) if spread else None,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
 
                     # Log for debugging
                     logger.info(
-                        f"📊 {symbol} | Price: {display_price} | "
-                        f"24h: H:{high_24h} L:{low_24h} | Chg: {change_pct:.2f}%"
+                        f"📊 {symbol} | Price: {display_price:.2f} | "
+                        f"Open: {open_24h} | High: {high_24h} | Low: {low_24h} | "
+                        f"Vol: {volume_24h} | Chg: {change_pct:.2f}%"
                     )
 
                     await broadcast()
 
+        except websockets.exceptions.ConnectionClosed:
+            is_delta_connected = False
+            logger.warning("⚠️ Delta WS connection closed, reconnecting...")
+            await asyncio.sleep(5)
         except Exception as e:
             is_delta_connected = False
             logger.error(f"❌ Delta WS error: {e}")
