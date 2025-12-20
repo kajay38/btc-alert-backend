@@ -40,7 +40,7 @@ SYMBOLS = ["BTCUSD", "ETHUSD"]
 PORT = int(os.environ.get("PORT", 8000))
 
 # ===============================
-# GLOBAL STATE (Saara data yahan store hoga)
+# GLOBAL STATE (Enhanced with today + previous day data)
 # ===============================
 latest_ticks: Dict[str, Dict[str, Any]] = {
     s: {
@@ -48,18 +48,39 @@ latest_ticks: Dict[str, Dict[str, Any]] = {
         "price": None,
         "mark_price": None,
         "ltp": None,
-        "open_24h": None,
-        "high_24h": None,
-        "low_24h": None,
-        "volume_24h": None,
-        "change_percent": 0.0,
+        
+        # TODAY'S DATA
+        "today": {
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+            "volume": None,
+            "change_value": None,
+            "change_percent": None,
+        },
+        
+        # PREVIOUS DAY'S DATA
+        "previous_day": {
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+            "volume": None,
+        },
+        
+        # ORDER BOOK
         "bid": None,
         "ask": None,
         "spread": None,
+        
         "timestamp": None,
     }
     for s in SYMBOLS
 }
+
+# Store previous day's close for comparison
+previous_day_close: Dict[str, float] = {s: None for s in SYMBOLS}
 
 active_clients: Set[WebSocket] = set()
 is_delta_connected = False
@@ -107,16 +128,40 @@ def init_firestore():
         db = None
 
 # ===============================
-# DELTA WEBSOCKET LISTENER (FIXED)
+# HELPER: Store Previous Day Data
+# ===============================
+def store_previous_day_data(symbol: str, data: dict):
+    """
+    Store previous day's data at day rollover (00:00 UTC)
+    Call this function when you detect a new day
+    """
+    global previous_day_close
+    
+    if latest_ticks[symbol]["today"]["close"]:
+        previous_day_close[symbol] = latest_ticks[symbol]["today"]["close"]
+        
+        latest_ticks[symbol]["previous_day"] = {
+            "open": latest_ticks[symbol]["today"]["open"],
+            "high": latest_ticks[symbol]["today"]["high"],
+            "low": latest_ticks[symbol]["today"]["low"],
+            "close": latest_ticks[symbol]["today"]["close"],
+            "volume": latest_ticks[symbol]["today"]["volume"],
+        }
+        
+        logger.info(f"📅 Stored previous day data for {symbol}")
+
+# ===============================
+# DELTA WEBSOCKET LISTENER (ENHANCED)
 # ===============================
 async def delta_ws_listener():
     """
     Connects to Delta Exchange WebSocket and streams market data.
-    Automatically reconnects on disconnection with infinite retries.
+    Now tracks both today's and previous day's data.
     """
     global is_delta_connected
     
     reconnect_delay = 5  # seconds
+    current_day = datetime.now(timezone.utc).day
     
     while not shutdown_event.is_set():
         try:
@@ -155,6 +200,13 @@ async def delta_ws_listener():
                         if symbol not in SYMBOLS:
                             continue
 
+                        # Check for day rollover
+                        now = datetime.now(timezone.utc)
+                        if now.day != current_day:
+                            for sym in SYMBOLS:
+                                store_previous_day_data(sym, data)
+                            current_day = now.day
+
                         # RAW DATA EXTRACTION
                         mark_price = data.get("mark_price")
                         ltp = data.get("close")
@@ -178,14 +230,18 @@ async def delta_ws_listener():
                         else:
                             display_price = 0.0
                         
+                        # Calculate change (absolute and percentage)
+                        change_value = 0.0
                         change_pct = 0.0
                         if open_24h and ltp:
                             try:
                                 o = float(open_24h)
                                 c = float(ltp)
                                 if o > 0:
-                                    change_pct = ((c - o) / o) * 100
+                                    change_value = c - o
+                                    change_pct = (change_value / o) * 100
                             except (ValueError, ZeroDivisionError):
+                                change_value = 0.0
                                 change_pct = 0.0
 
                         spread = 0.0
@@ -201,14 +257,26 @@ async def delta_ws_listener():
                             "price": round(display_price, 2) if display_price else None,
                             "mark_price": float(mark_price) if mark_price else None,
                             "ltp": float(ltp) if ltp else None,
-                            "open_24h": float(open_24h) if open_24h else None,
-                            "high_24h": float(high_24h) if high_24h else None,
-                            "low_24h": float(low_24h) if low_24h else None,
-                            "volume_24h": float(volume_24h) if volume_24h else None,
-                            "change_percent": round(change_pct, 2),
+                            
+                            # TODAY'S DATA
+                            "today": {
+                                "open": float(open_24h) if open_24h else None,
+                                "high": float(high_24h) if high_24h else None,
+                                "low": float(low_24h) if low_24h else None,
+                                "close": float(ltp) if ltp else None,
+                                "volume": float(volume_24h) if volume_24h else None,
+                                "change_value": round(change_value, 2),
+                                "change_percent": round(change_pct, 2),
+                            },
+                            
+                            # PREVIOUS DAY'S DATA (preserved from last rollover)
+                            "previous_day": latest_ticks[symbol]["previous_day"],
+                            
+                            # ORDER BOOK
                             "bid": float(bid) if bid else None,
                             "ask": float(ask) if ask else None,
                             "spread": round(spread, 4) if spread else None,
+                            
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
 
@@ -436,6 +504,52 @@ def get_market_data(symbol: str):
     return {
         "status": "success",
         "data": latest_ticks.get(symbol),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+# ===============================
+# NEW: COMPARISON ENDPOINT
+# ===============================
+@app.get("/market/{symbol}/comparison")
+def get_comparison(symbol: str):
+    """Compare today's data with previous day"""
+    symbol = symbol.upper()
+    
+    if symbol not in SYMBOLS:
+        return {
+            "status": "error",
+            "message": f"Symbol {symbol} not found. Available symbols: {', '.join(SYMBOLS)}"
+        }
+    
+    data = latest_ticks.get(symbol)
+    today = data["today"]
+    prev = data["previous_day"]
+    
+    # Calculate day-over-day changes
+    comparison = {}
+    if prev["close"] and today["close"]:
+        comparison["close_change"] = round(today["close"] - prev["close"], 2)
+        comparison["close_change_percent"] = round(
+            ((today["close"] - prev["close"]) / prev["close"]) * 100, 2
+        )
+    
+    if prev["high"] and today["high"]:
+        comparison["high_change"] = round(today["high"] - prev["high"], 2)
+    
+    if prev["low"] and today["low"]:
+        comparison["low_change"] = round(today["low"] - prev["low"], 2)
+    
+    if prev["volume"] and today["volume"]:
+        comparison["volume_change_percent"] = round(
+            ((today["volume"] - prev["volume"]) / prev["volume"]) * 100, 2
+        )
+    
+    return {
+        "status": "success",
+        "symbol": symbol,
+        "today": today,
+        "previous_day": prev,
+        "comparison": comparison,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
