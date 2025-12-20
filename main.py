@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ===============================
-# LOGGING
+# LOGGING (Backend monitoring ke liye)
 # ===============================
 logging.basicConfig(
     level=logging.INFO,
@@ -28,16 +28,22 @@ DELTA_WS_URL = "wss://socket.india.delta.exchange"
 SYMBOLS = ["BTCUSD", "ETHUSD"]
 
 # ===============================
-# GLOBAL STATE
+# GLOBAL STATE (Saara data yahan store hoga)
 # ===============================
 latest_ticks: Dict[str, Dict[str, Any]] = {
     s: {
         "symbol": s,
-        "price": None,        # calculated display price
+        "price": None,            # Current Display Price
         "mark_price": None,
-        "ltp": None,
+        "ltp": None,              # Last Traded Price (Close)
+        "open_24h": None,         # 24 ghante pehle ka price
+        "high_24h": None,         # Aaj ka High
+        "low_24h": None,          # Aaj ka Low
+        "volume_24h": None,       # Trading Volume
+        "change_percent": 0.0,    # Kitne percent up/down hai
         "bid": None,
         "ask": None,
+        "spread": None,           # Bid aur Ask ka difference
         "timestamp": None,
     }
     for s in SYMBOLS
@@ -47,7 +53,7 @@ active_clients: Set[WebSocket] = set()
 is_delta_connected = False
 
 # ===============================
-# FIRESTORE (OPTIONAL / SAFE)
+# FIRESTORE (Agar use karna ho toh)
 # ===============================
 db = None
 
@@ -71,16 +77,6 @@ def init_firestore():
     except Exception as e:
         logger.error(f"❌ Firestore init failed: {e}")
         db = None
-
-# ===============================
-# ALERT MODEL (FOR LATER USE)
-# ===============================
-class AlertCreate(BaseModel):
-    symbol: str
-    type: str                 # above | below | range
-    from_price: float
-    to_price: Optional[float] = None
-    note: str
 
 # ===============================
 # DELTA WEBSOCKET LISTENER
@@ -114,46 +110,69 @@ async def delta_ws_listener():
                     await asyncio.sleep(0)
                     data = json.loads(msg)
 
+                    # Basic validation
                     symbol = data.get("symbol")
                     if symbol not in SYMBOLS:
                         continue
 
                     # ---------------------------
-                    # RAW FIELDS FROM DELTA
+                    # RAW DATA EXTRACTION
                     # ---------------------------
                     mark_price = data.get("mark_price")
-                    ltp = data.get("close")           # last traded price
+                    ltp = data.get("close")               # Current price
+                    open_24h = data.get("open_24h")
+                    high_24h = data.get("high_24h")
+                    low_24h = data.get("low_24h")
+                    volume_24h = data.get("volume_24h")
+                    
                     quotes = data.get("quotes") or {}
                     bid = quotes.get("best_bid")
                     ask = quotes.get("best_ask")
 
                     # ---------------------------
-                    # CALCULATED DISPLAY PRICE
+                    # CALCULATIONS
                     # ---------------------------
-                    display_price = None
+                    # 1. Display Price (Mid of Bid/Ask)
+                    display_price = float(ltp) if ltp else 0.0
                     if bid and ask:
                         display_price = (float(bid) + float(ask)) / 2
-                    elif mark_price:
-                        display_price = float(mark_price)
-                    elif ltp:
-                        display_price = float(ltp)
+                    
+                    # 2. Percentage Change
+                    change_pct = 0.0
+                    if open_24h and ltp:
+                        o = float(open_24h)
+                        c = float(ltp)
+                        if o > 0:
+                            change_pct = ((c - o) / o) * 100
+
+                    # 3. Spread
+                    spread = 0.0
+                    if bid and ask:
+                        spread = float(ask) - float(bid)
 
                     # ---------------------------
                     # UPDATE GLOBAL STATE
                     # ---------------------------
                     latest_ticks[symbol] = {
                         "symbol": symbol,
-                        "price": display_price,
+                        "price": round(display_price, 2),
                         "mark_price": float(mark_price) if mark_price else None,
                         "ltp": float(ltp) if ltp else None,
+                        "open_24h": float(open_24h) if open_24h else None,
+                        "high_24h": float(high_24h) if high_24h else None,
+                        "low_24h": float(low_24h) if low_24h else None,
+                        "volume_24h": float(volume_24h) if volume_24h else None,
+                        "change_percent": round(change_pct, 2),
                         "bid": float(bid) if bid else None,
                         "ask": float(ask) if ask else None,
+                        "spread": round(spread, 4),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
 
+                    # Log for debugging
                     logger.info(
-                        f"📊 {symbol} | price={display_price} "
-                        f"mark={mark_price} ltp={ltp} bid/ask={bid}/{ask}"
+                        f"📊 {symbol} | Price: {display_price} | "
+                        f"24h: H:{high_24h} L:{low_24h} | Chg: {change_pct:.2f}%"
                     )
 
                     await broadcast()
@@ -164,7 +183,7 @@ async def delta_ws_listener():
             await asyncio.sleep(5)
 
 # ===============================
-# BROADCAST TO FLUTTER CLIENTS
+# BROADCAST TO CLIENTS
 # ===============================
 async def broadcast():
     if not active_clients:
@@ -187,21 +206,19 @@ async def broadcast():
         active_clients.discard(ws)
 
 # ===============================
-# FASTAPI APP (RAILWAY SAFE)
+# FASTAPI SETUP
 # ===============================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_firestore()
-
     async def start_ws():
-        await asyncio.sleep(3)  # Railway health check safe
+        await asyncio.sleep(2) 
         await delta_ws_listener()
-
     task = asyncio.create_task(start_ws())
     yield
     task.cancel()
 
-app = FastAPI(title="BTC Delta Market Backend", lifespan=lifespan)
+app = FastAPI(title="Delta Advanced Market API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -210,37 +227,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===============================
-# HEALTH CHECK
-# ===============================
 @app.get("/")
 def root():
     return {
         "status": "up",
-        "delta_ws": "connected" if is_delta_connected else "disconnected",
         "symbols": SYMBOLS,
-        "sample": latest_ticks,
+        "data": latest_ticks,
     }
 
-# ===============================
-# FLUTTER WEBSOCKET
-# ===============================
 @app.websocket("/ws/market")
 async def ws_market(ws: WebSocket):
     await ws.accept()
     active_clients.add(ws)
-    logger.info(f"📱 Flutter client connected ({len(active_clients)})")
-
     try:
         while True:
-            await ws.receive_text()  # keep alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         active_clients.discard(ws)
-        logger.info(f"📱 Flutter client disconnected ({len(active_clients)})")
 
-# ===============================
-# LOCAL RUN
-# ===============================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
