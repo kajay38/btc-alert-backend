@@ -1,65 +1,72 @@
-import httpx
-import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-
-logger = logging.getLogger("DELTA-HISTORY")
+import aiohttp
+import time
 
 class DeltaHistory:
-    BASE_URL = "https://api.delta.exchange/v2"
-
+    BASE_URL = "https://api.india.delta.exchange/v2"
+    
     @staticmethod
-    async def fetch_candles(
-        symbol: str, 
-        resolution: str = "1h", 
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
+    async def fetch_candles(symbol, resolution, limit=100):
         """
-        Delta Exchange se historical candle data fetch karega.
-        Resolutions: '1m', '5m', '15m', '30m', '1h', '2h', '4h', '1d', '1w'
-        """
-        # Delta API endpoint for history
-        url = f"{DeltaHistory.BASE_URL}/history/candles"
+        Fetch historical candles from Delta Exchange
         
-        # Start and End timestamps calculate karein
-        # Example: pichle kuch dinon ka data
-        end_time = int(datetime.now().timestamp())
-        # Resolution ke hisaab se piche jayein (approx)
-        start_time = int((datetime.now() - timedelta(days=7)).timestamp())
-
-        params = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "start": start_time,
-            "end": end_time,
-            "limit": limit
-        }
-
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data.get("success"):
-                    # Delta API returns a list of candle objects
-                    candles = data.get("result", [])
-                    logger.info(f"✅ Fetched {len(candles)} candles for {symbol}")
-                    return candles
-                else:
-                    logger.error(f"❌ API Error: {data.get('error')}")
-                    return []
-                    
-            except Exception as e:
-                logger.error(f"❌ Failed to fetch history for {symbol}: {e}")
-                return []
-
-# Example Format jo Delta return karta hai:
-# {
-#   "time": 1672531200,
-#   "open": "16500.5",
-#   "high": "16600.0",
-#   "low": "16450.0",
-#   "close": "16580.0",
-#   "volume": "120.5"
-# }
+        Args:
+            symbol: Trading symbol (e.g., "BTCUSD")
+            resolution: Timeframe (e.g., "1h", "5m", "1d")
+            limit: Number of candles to fetch (default: 100)
+        
+        Returns:
+            List of candle data or None if error
+        """
+        try:
+            # Calculate time range based on limit
+            end_time = int(time.time())
+            
+            # Resolution to seconds mapping
+            resolution_seconds = {
+                "1m": 60,
+                "3m": 180,
+                "5m": 300,
+                "15m": 900,
+                "30m": 1800,
+                "1h": 3600,
+                "2h": 7200,
+                "4h": 14400,
+                "6h": 21600,
+                "1d": 86400,
+                "1w": 604800
+            }
+            
+            if resolution not in resolution_seconds:
+                print(f"❌ Invalid resolution: {resolution}")
+                return None
+            
+            # Calculate start time
+            seconds_per_candle = resolution_seconds[resolution]
+            start_time = end_time - (limit * seconds_per_candle)
+            
+            # API endpoint
+            url = f"{DeltaHistory.BASE_URL}/history/candles"
+            params = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "start": start_time,
+                "end": end_time
+            }
+            
+            # Make async request
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("success"):
+                            return data.get("result", [])
+                        else:
+                            print(f"❌ API Error: {data}")
+                            return None
+                    else:
+                        print(f"❌ HTTP Error: {response.status}")
+                        return None
+                        
+        except Exception as e:
+            print(f"❌ Exception: {str(e)}")
+            return None
