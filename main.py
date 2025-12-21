@@ -33,7 +33,7 @@ logger = logging.getLogger("DELTA-BACKEND")
 # ===============================
 # CONFIG - DELTA EXCHANGE INDIA SPECIFIC
 # ===============================
-DELTA_WS_URL = "wss://socket.india.delta.exchange"
+DELTA_WS_URL = "wss://socket.delta.exchange"
 
 # ✅ Delta Exchange India के मुख्य trading pairs
 SYMBOLS = [
