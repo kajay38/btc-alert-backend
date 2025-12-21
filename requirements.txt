@@ -1,32 +1,7 @@
-[file name]: requirements.txt
-[file content begin]
-# FastAPI Core
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 websockets==12.0
-
-# HTTP/Async
-aiohttp==3.9.1
-httpx==0.25.2
-
-# Database & Storage
-pydantic>=2.10.0
 python-dotenv==1.0.0
-firebase-admin==6.5.0
-
-# Utilities
 requests==2.31.0
-python-multipart==0.0.6
-asyncio-throttle==1.0.2
-backoff==2.2.1
-cryptography==41.0.7
-python-jose[cryptography]==3.3.0
-
-# Railway specific
-gunicorn==21.2.0
-watchfiles==0.21.0
-
-# Development
-pytest==7.4.3
-pytest-asyncio==0.21.1
-[file content end]
+aiohttp==3.9.1
+pydantic==2.5.0
