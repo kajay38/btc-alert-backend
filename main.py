@@ -879,15 +879,16 @@ async def ws_trading(ws: WebSocket):
 # ===============================
 if __name__ == "__main__":
     import uvicorn
+    import os
     
-    logger.info(f"🚀 Starting Delta India Trading API on 0.0.0.0:{PORT}")
+    port = int(os.environ.get("PORT", 8000))
     
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
-        port=PORT,
-        log_level="info",
-        access_log=True,
-        timeout_keep_alive=75,
+        port=port,
+        reload=False,
+        workers=1,
+        log_level="info"
     )
 [file content end]
