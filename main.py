@@ -824,21 +824,22 @@ def get_all_indicators():
 # ===============================
 # WEBSOCKET ENDPOINT
 # ===============================
-@app.websocket("/ws/trading")
-async def ws_trading(ws: WebSocket):
-    """WebSocket endpoint for real-time trading data"""
+# Add this endpoint to match your client's expectation
+@app.websocket("/ws/market")
+async def ws_market(ws: WebSocket):
+    """WebSocket endpoint for real-time market data (alias for /ws/trading)"""
     await ws.accept()
     active_clients.add(ws)
-    logger.info(f"✅ Trading client connected. Total: {len(active_clients)}")
+    logger.info(f"✅ Market client connected. Total: {len(active_clients)}")
     
     try:
-        # Send initial data
+        # Send initial data immediately
         await broadcast()
         
-        # Keep connection alive
+        # Keep connection alive and handle messages
         while True:
             try:
-                # Handle client messages
+                # Wait for client messages with timeout
                 data = await asyncio.wait_for(ws.receive_text(), timeout=30.0)
                 
                 # Process client commands
@@ -848,6 +849,13 @@ async def ws_trading(ws: WebSocket):
                     
                     if cmd_type == "ping":
                         await ws.send_json({"type": "pong"})
+                    elif cmd_type == "subscribe":
+                        # Handle symbol subscription
+                        symbols = command.get("symbols", [])
+                        await ws.send_json({
+                            "type": "subscribed",
+                            "symbols": symbols,
+                        })
                     elif cmd_type == "get_portfolio":
                         await ws.send_json({
                             "type": "portfolio",
@@ -855,17 +863,17 @@ async def ws_trading(ws: WebSocket):
                         })
                     
                 except json.JSONDecodeError:
-                    pass
+                    logger.warning("⚠️ Invalid JSON from client")
                     
             except asyncio.TimeoutError:
-                # Send ping to keep alive
+                # Send ping to keep connection alive
                 try:
                     await ws.send_json({"type": "ping"})
                 except Exception:
                     break
                     
     except WebSocketDisconnect:
-        logger.info("❌ Client disconnected")
+        logger.info("❌ Market client disconnected")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
     finally:
