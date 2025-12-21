@@ -1,5 +1,3 @@
-[file name]: analysis_worker.py
-[file content begin]
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -164,4 +162,3 @@ class AnalysisWorker:
         """Stop the worker"""
         self.is_running = False
         logger.info("⏹️ Trading analysis stopped")
-[file content end]
