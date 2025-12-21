@@ -1,5 +1,3 @@
-[file name]: main.py
-[file content begin]
 import asyncio
 import json
 import os
@@ -890,4 +888,4 @@ if __name__ == "__main__":
         access_log=True,
         timeout_keep_alive=75,
     )
-[file content end]
+
