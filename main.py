@@ -881,14 +881,23 @@ if __name__ == "__main__":
     import uvicorn
     import os
     
+    # Railway PORT variable
     port = int(os.environ.get("PORT", 8000))
     
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        workers=1,
-        log_level="info"
-    )
+    print(f"🚀 Starting server on port {port}")
+    print(f"📊 Environment: {os.environ.get('RAILWAY_ENVIRONMENT', 'development')}")
+    
+    try:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",  # Important for Railway
+            port=port,
+            reload=False,    # Railway पर reload False रखें
+            workers=1,       # Single worker for Railway
+            log_level="info",
+            access_log=True,
+        )
+    except Exception as e:
+        print(f"❌ Server failed to start: {e}")
+        raise
 [file content end]
