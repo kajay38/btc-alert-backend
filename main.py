@@ -320,18 +320,22 @@ async def delta_ws_listener():
                 close_timeout=10,
             ) as ws:
 
-                # ✅ Subscribe to multiple channels for trading
+                # ✅ FIXED: Subscribe only to v2/ticker (all_trades is separate)
                 subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
                         "channels": [
-                            {"name": "v2/ticker", "symbols": SYMBOLS},
-                            {"name": "v2/trades", "symbols": SYMBOLS[:5]},  # Top 5 for trade history
+                            {
+                                "name": "v2/ticker",
+                                "symbols": SYMBOLS  # Subscribe to all your symbols
+                            }
                         ]
                     },
                 }
 
                 await ws.send(json.dumps(subscribe_msg))
+                logger.info(f"📤 Sent subscription: {subscribe_msg}")
+                
                 is_delta_connected = True
                 logger.info("✅ Delta WS connected and subscribed")
 
@@ -342,10 +346,24 @@ async def delta_ws_listener():
                         
                     try:
                         data = json.loads(msg)
-                        channel = data.get("channel")
-                        symbol = data.get("symbol")
                         
+                        # ✅ FIXED: Log the message type for debugging
+                        msg_type = data.get("type")
+                        
+                        # Handle subscription confirmation
+                        if msg_type == "subscriptions":
+                            logger.info(f"✅ Subscription confirmed: {data}")
+                            continue
+                        
+                        # ✅ FIXED: Check for "type" field, not "channel"
+                        if msg_type != "v2/ticker":
+                            # Log unexpected messages for debugging
+                            logger.debug(f"Received message type: {msg_type}")
+                            continue
+                        
+                        symbol = data.get("symbol")
                         if not symbol or symbol not in SYMBOLS:
+                            logger.warning(f"⚠️ Unknown symbol: {symbol}")
                             continue
 
                         # Check for day rollover
@@ -367,12 +385,9 @@ async def delta_ws_listener():
                             current_day = now.day
                             logger.info("📅 New trading day started")
 
-                        # Process based on channel type
-                        if channel == "v2/ticker":
-                            await _process_ticker_data(symbol, data)
-                        elif channel == "v2/trades":
-                            await _process_trade_data(symbol, data)
-                            
+                        # ✅ Process ticker data
+                        await _process_ticker_data(symbol, data)
+                        
                         # Generate trading signals if analysis worker is active
                         if ANALYSIS_ENABLED and analysis_worker:
                             indicators = analysis_worker.get_indicators(symbol)
@@ -392,7 +407,7 @@ async def delta_ws_listener():
                         logger.warning("⚠️ Invalid JSON received from Delta WS")
                         continue
                     except Exception as e:
-                        logger.error(f"❌ Error processing message: {e}")
+                        logger.error(f"❌ Error processing message: {e}", exc_info=True)
                         continue
 
         except websockets.exceptions.ConnectionClosed as e:
@@ -405,7 +420,7 @@ async def delta_ws_listener():
             
         except Exception as e:
             is_delta_connected = False
-            logger.error(f"❌ Unexpected error in Delta WS: {e}")
+            logger.error(f"❌ Unexpected error in Delta WS: {e}", exc_info=True)
         
         # Wait before reconnecting (unless shutting down)
         if not shutdown_event.is_set():
@@ -419,6 +434,7 @@ async def delta_ws_listener():
                 pass  # Continue to reconnect
     
     logger.info("🛑 Delta WS listener stopped")
+
 
 async def _process_ticker_data(symbol: str, data: dict):
     """Process ticker data from Delta"""
