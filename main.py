@@ -575,9 +575,6 @@ def health_check():
         "symbols": SYMBOLS,
     }
 
-# ===============================
-# TRADING ENDPOINTS (FIXED)
-# ===============================
 @app.get("/trading/config")
 def get_trading_config():
     return {
@@ -593,79 +590,36 @@ def get_trading_config():
 
 @app.get("/trading/calculator")
 def trading_calculator(
-    symbol: str,  # Required parameter
+    symbol: str,
     risk_amount: float = 100.0,
     stop_loss_percent: float = 2.0,
     take_profit_percent: float = 4.0,
     leverage: int = 1
 ):
-    """
-    Trading position calculator
-    
-    Parameters:
-    - symbol: Trading symbol (e.g., BTCUSD, ETHUSD) - REQUIRED
-    - risk_amount: Amount willing to risk in USD (default: 100)
-    - stop_loss_percent: Stop loss percentage (default: 2.0)
-    - take_profit_percent: Take profit percentage (default: 4.0)
-    - leverage: Leverage multiplier (default: 1)
-    
-    Example:
-    /trading/calculator?symbol=BTCUSD&risk_amount=100&stop_loss_percent=2&take_profit_percent=4&leverage=10
-    """
     symbol = symbol.upper()
-    
-    # Validate symbol
     if symbol not in SYMBOLS:
-        return {
-            "status": "error",
-            "message": f"Symbol '{symbol}' not supported",
-            "supported_symbols": SYMBOLS,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        return {"status": "error", "message": f"Symbol {symbol} not supported"}
     
-    # Get current price
     current_price = latest_ticks[symbol].get("price", 0)
     if not current_price:
-        return {
-            "status": "error",
-            "message": f"No price data available for {symbol}. Please wait for WebSocket connection.",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        return {"status": "error", "message": "No price data available"}
     
-    # Validate parameters
-    if risk_amount <= 0:
-        return {"status": "error", "message": "risk_amount must be greater than 0"}
-    
-    if stop_loss_percent <= 0 or stop_loss_percent >= 100:
-        return {"status": "error", "message": "stop_loss_percent must be between 0 and 100"}
-    
-    if take_profit_percent <= 0:
-        return {"status": "error", "message": "take_profit_percent must be greater than 0"}
-    
-    if leverage < 1 or leverage > 200:
-        return {"status": "error", "message": "leverage must be between 1 and 200"}
-    
-    # Calculate position size
     num_contracts = calculate_position_size(symbol, risk_amount, stop_loss_percent)
     contract_value = TRADING_CONFIG["contract_values"].get(symbol, 1)
     position_value = num_contracts * contract_value * current_price
     
-    # Price calculations
     stop_loss_price = current_price * (1 - stop_loss_percent/100)
     take_profit_price = current_price * (1 + take_profit_percent/100)
     risk_reward_ratio = take_profit_percent / stop_loss_percent
     
-    # Leverage calculations
     margin_required = position_value / leverage
     
-    # Liquidation price (simplified calculation)
     if leverage > 1:
         liquidation_buffer = (1 / leverage) * 0.9
         liquidation_price = current_price * (1 - liquidation_buffer)
     else:
         liquidation_price = None
     
-    # P&L calculations
     potential_loss = num_contracts * contract_value * (current_price - stop_loss_price)
     potential_profit = num_contracts * contract_value * (take_profit_price - current_price)
     
@@ -694,128 +648,39 @@ def trading_calculator(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-# ✅ NEW: Simplified calculator endpoint with symbol in path
-@app.get("/trading/calculator/{symbol}")
-def trading_calculator_simple(
-    symbol: str,
-    risk_amount: float = 100.0,
-    stop_loss_percent: float = 2.0,
-    take_profit_percent: float = 4.0,
-    leverage: int = 1
-):
-    """
-    Simplified trading calculator with symbol in URL path
-    
-    Example:
-    /trading/calculator/BTCUSD?risk_amount=100&stop_loss_percent=2
-    """
-    return trading_calculator(symbol, risk_amount, stop_loss_percent, take_profit_percent, leverage)
-
-@app.get("/trading/signals")
-def get_trading_signals(symbol: str = None):
-    """
-    Get trading signals for all or specific symbol
-    
-    Parameters:
-    - symbol: Optional - specific symbol to get signal for
-    
-    Examples:
-    /trading/signals - Get all signals
-    /trading/signals?symbol=BTCUSD - Get signal for BTCUSD
-    """
-    if symbol:
-        symbol = symbol.upper()
-        if symbol not in SYMBOLS:
-            return {
-                "status": "error",
-                "message": f"Symbol '{symbol}' not supported",
-                "supported_symbols": SYMBOLS,
-            }
-        
-        signal = trading_signals.get(symbol)
-        if not signal or signal.get("signal") == "NEUTRAL":
-            return {
-                "status": "no_signal",
-                "message": "No active trading signals",
-                "symbol": symbol,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        
-        return {
-            "status": "success",
-            "signal": signal,
-            "symbol": symbol,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    
-    # Return all signals
-    active_signals = {s: sig for s, sig in trading_signals.items() if sig.get("signal") != "NEUTRAL"}
-    
+@app.get("/market")
+def get_all_market_data():
     return {
         "status": "success",
-        "signals": active_signals,
-        "total_signals": len(active_signals),
+        "data": latest_ticks,
+        "signals": trading_signals,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-# ✅ NEW: Get available symbols
-@app.get("/symbols")
-def get_symbols():
-    """Get list of all supported trading symbols"""
-    symbols_info = []
-    
-    for symbol in SYMBOLS:
-        data = latest_ticks.get(symbol, {})
-        symbols_info.append({
-            "symbol": symbol,
-            "price": data.get("price"),
-            "change_24h": data.get("today", {}).get("change_percent"),
-            "volume_24h": data.get("today", {}).get("volume"),
-            "min_order_size": TRADING_CONFIG["min_order_size"].get(symbol),
-            "tick_size": TRADING_CONFIG["tick_size"].get(symbol),
-            "contract_value": TRADING_CONFIG["contract_values"].get(symbol),
-        })
-    
-    return {
-        "status": "success",
-        "symbols": symbols_info,
-        "total": len(symbols_info),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-# ✅ NEW: Quick price check
-@app.get("/price/{symbol}")
-def get_price(symbol: str):
-    """
-    Get current price for a symbol
-    
-    Example:
-    /price/BTCUSD
-    """
+@app.get("/market/{symbol}")
+def get_symbol_data(symbol: str):
     symbol = symbol.upper()
-    
     if symbol not in SYMBOLS:
-        return {
-            "status": "error",
-            "message": f"Symbol '{symbol}' not supported",
-            "supported_symbols": SYMBOLS,
-        }
+        return {"status": "error", "message": f"Symbol {symbol} not supported"}
     
     data = latest_ticks.get(symbol, {})
+    signal = trading_signals.get(symbol, {})
+    
+    trading_info = {
+        "min_order_size": TRADING_CONFIG["min_order_size"].get(symbol),
+        "tick_size": TRADING_CONFIG["tick_size"].get(symbol),
+        "contract_value": TRADING_CONFIG["contract_values"].get(symbol),
+        "leverage_options": TRADING_CONFIG["leverage_options"],
+    }
     
     return {
         "status": "success",
         "symbol": symbol,
-        "price": data.get("price"),
-        "mark_price": data.get("mark_price"),
-        "bid": data.get("bid"),
-        "ask": data.get("ask"),
-        "spread": data.get("spread"),
-        "change_24h": data.get("today", {}).get("change_percent"),
-        "volume_24h": data.get("today", {}).get("volume"),
+        "market_data": data,
+        "trading_info": trading_info,
+        "signal": signal,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
 
 @app.websocket("/ws/market")
 async def ws_market(ws: WebSocket):
