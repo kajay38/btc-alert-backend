@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import base64
 import logging
 import signal
 from datetime import datetime, timezone
@@ -49,34 +48,49 @@ SYMBOLS = [
     "MATICUSD",    # Polygon
 ]
 
-# ✅ Trading के लिए जरूरी configuration
+# ✅ Trading के लिए जरूरी configuration (CORRECTED VALUES)
 TRADING_CONFIG = {
+    # ✅ FIXED: All minimum order sizes are 1 contract (Delta uses contract-based sizing)
     "min_order_size": {
-      "BTCUSD": 1,      # 1 contract = 0.001 BTC
-    "ETHUSD": 1,      # 1 contract = 0.01 ETH
-    "SOLUSD": 1,      # 1 contract = 1 SOL
-    "BNBUSD": 1,
-    "XRPUSD": 1,
-    "ADAUSD": 1,
-    "DOGEUSD": 1,
-    "DOTUSD": 1,
-    "LTCUSD": 1,
-    "MATICUSD": 1,
-}
+        "BTCUSD": 1,      # 1 contract = 0.001 BTC
+        "ETHUSD": 1,      # 1 contract = 0.01 ETH
+        "SOLUSD": 1,      # 1 contract = 1 SOL
+        "BNBUSD": 1,      # 1 contract = 0.1 BNB
+        "XRPUSD": 1,      # 1 contract = 1 XRP
+        "ADAUSD": 1,      # 1 contract = 1 ADA
+        "DOGEUSD": 1,     # 1 contract = 100 DOGE
+        "DOTUSD": 1,      # 1 contract (verify with API)
+        "LTCUSD": 1,      # 1 contract (verify with API)
+        "MATICUSD": 1,    # 1 contract (verify with API)
+    },
+    # ✅ FIXED: Accurate tick sizes from Delta Exchange API
     "tick_size": {
         "BTCUSD": 0.5,
         "ETHUSD": 0.05,
         "SOLUSD": 0.0001,
-        "BNBUSD": 0.01,
+        "BNBUSD": 0.001,
         "XRPUSD": 0.0001,
-        "ADAUSD": 0.0001,
+        "ADAUSD": 0.00001,
         "DOGEUSD": 0.000001,
-        "DOTUSD": 0.001,
-        "LTCUSD": 0.01,
-        "MATICUSD": 0.001,
+        "DOTUSD": 0.001,      # Verify with API
+        "LTCUSD": 0.01,       # Verify with API
+        "MATICUSD": 0.0001,   # Verify with API
+    },
+    # ✅ Contract values (for position calculations)
+    "contract_values": {
+        "BTCUSD": 0.001,
+        "ETHUSD": 0.01,
+        "SOLUSD": 1,
+        "BNBUSD": 0.1,
+        "XRPUSD": 1,
+        "ADAUSD": 1,
+        "DOGEUSD": 100,
+        "DOTUSD": 1,
+        "LTCUSD": 0.1,
+        "MATICUSD": 1,
     },
     "leverage_options": [1, 2, 3, 5, 10, 20, 50, 100],
-    "supported_order_types": ["limit", "market", "stop", "stop_limit"],
+    "supported_order_types": ["limit_order", "market_order", "stop_market_order", "stop_limit_order"],
 }
 
 # ✅ Railway PORT support
@@ -149,9 +163,9 @@ latest_ticks: Dict[str, Dict[str, Any]] = {
 # ✅ Trading Signals Storage
 trading_signals: Dict[str, Dict[str, Any]] = {
     s: {
-        "buy_signals": [],
-        "sell_signals": [],
-        "strength": 0,
+        "signal": "NEUTRAL",
+        "confidence": 0,
+        "reasons": [],
         "last_signal_time": None,
     }
     for s in SYMBOLS
@@ -191,21 +205,33 @@ if ANALYSIS_ENABLED:
 def calculate_position_size(symbol: str, risk_amount: float, stop_loss_percent: float) -> int:
     """
     Position size calculator (Risk Management)
-    Returns: Number of contracts (integer)
+    
+    Args:
+        symbol: Trading symbol
+        risk_amount: Amount willing to risk (in USD)
+        stop_loss_percent: Stop loss percentage
+    
+    Returns:
+        int: Number of contracts (must be integer >= 1)
     """
     current_price = latest_ticks[symbol].get("price")
-    if not current_price:
+    if not current_price or current_price == 0:
         return 1  # Minimum 1 contract
     
-    # Calculate position size
-    risk_per_unit = current_price * (stop_loss_percent / 100)
-    if risk_per_unit == 0:
+    # Get contract value
+    contract_value = TRADING_CONFIG["contract_values"].get(symbol, 1)
+    
+    # Calculate risk per contract
+    risk_per_contract = contract_value * current_price * (stop_loss_percent / 100)
+    
+    if risk_per_contract == 0:
         return 1
     
-    position_size = risk_amount / risk_per_unit
+    # Calculate number of contracts
+    num_contracts = risk_amount / risk_per_contract
     
-    # ✅ Round to nearest integer (contracts must be whole numbers)
-    contracts = max(1, round(position_size))
+    # ✅ FIXED: Round to nearest integer (contracts must be whole numbers)
+    contracts = max(1, round(num_contracts))
     
     return contracts
 
@@ -244,7 +270,7 @@ def generate_trading_signal(symbol: str, indicators: dict) -> dict:
         dict: Trading signal with confidence
     """
     if not indicators:
-        return {"signal": "NEUTRAL", "confidence": 0, "reason": "No data"}
+        return {"signal": "NEUTRAL", "confidence": 0, "reasons": [], "reason": "No data"}
     
     ema_9 = indicators.get("ema_9")
     ema_20 = indicators.get("ema_20")
@@ -252,7 +278,7 @@ def generate_trading_signal(symbol: str, indicators: dict) -> dict:
     current_price = latest_ticks[symbol].get("price")
     
     if not all([ema_9, ema_20, ema_50, current_price]):
-        return {"signal": "NEUTRAL", "confidence": 0, "reason": "Incomplete data"}
+        return {"signal": "NEUTRAL", "confidence": 0, "reasons": [], "reason": "Incomplete data"}
     
     signal_score = 0
     reasons = []
@@ -261,17 +287,23 @@ def generate_trading_signal(symbol: str, indicators: dict) -> dict:
     if ema_9 > ema_20 > ema_50:
         signal_score += 30
         reasons.append("EMA Bullish Alignment (9 > 20 > 50)")
+    elif ema_9 < ema_20 < ema_50:
+        signal_score -= 30
+        reasons.append("EMA Bearish Alignment (9 < 20 < 50)")
     
     if current_price > ema_20:
         signal_score += 20
         reasons.append("Price above EMA20")
+    else:
+        signal_score -= 20
+        reasons.append("Price below EMA20")
     
     if current_price > ema_50:
         signal_score += 20
         reasons.append("Price above EMA50")
-    
-    # RSI would be added here if available
-    # MACD would be added here if available
+    else:
+        signal_score -= 20
+        reasons.append("Price below EMA50")
     
     # Determine final signal
     if signal_score >= 50:
@@ -290,7 +322,7 @@ def generate_trading_signal(symbol: str, indicators: dict) -> dict:
     }
 
 # ===============================
-# DELTA WEBSOCKET LISTENER (ENHANCED FOR TRADING)
+# DELTA WEBSOCKET LISTENER (FIXED)
 # ===============================
 async def delta_ws_listener():
     """
@@ -300,6 +332,7 @@ async def delta_ws_listener():
     global is_delta_connected
     
     reconnect_delay = 5  # seconds
+    max_reconnect_delay = 60
     current_day = datetime.now(timezone.utc).day
     
     while not shutdown_event.is_set():
@@ -313,7 +346,7 @@ async def delta_ws_listener():
                 close_timeout=10,
             ) as ws:
 
-                # ✅ FIXED: Subscribe only to v2/ticker (all_trades is separate)
+                # ✅ Subscribe to v2/ticker channel
                 subscribe_msg = {
                     "type": "subscribe",
                     "payload": {
@@ -327,9 +360,10 @@ async def delta_ws_listener():
                 }
 
                 await ws.send(json.dumps(subscribe_msg))
-                logger.info(f"📤 Sent subscription: {subscribe_msg}")
+                logger.info(f"📤 Sent subscription for {len(SYMBOLS)} symbols")
                 
                 is_delta_connected = True
+                reconnect_delay = 5  # Reset delay on successful connection
                 logger.info("✅ Delta WS connected and subscribed")
 
                 # Listen for messages
@@ -340,23 +374,24 @@ async def delta_ws_listener():
                     try:
                         data = json.loads(msg)
                         
-                        # ✅ FIXED: Log the message type for debugging
+                        # ✅ Get message type
                         msg_type = data.get("type")
                         
                         # Handle subscription confirmation
                         if msg_type == "subscriptions":
-                            logger.info(f"✅ Subscription confirmed: {data}")
+                            logger.info(f"✅ Subscription confirmed: {data.get('channels', [])}")
                             continue
                         
-                        # ✅ FIXED: Check for "type" field, not "channel"
+                        # ✅ FIXED: Check for "ticker" not "v2/ticker"
                         if msg_type != "ticker":
                             # Log unexpected messages for debugging
-                            logger.debug(f"Received message type: {msg_type}")
+                            if msg_type:
+                                logger.debug(f"Received message type: {msg_type}")
                             continue
                         
                         symbol = data.get("symbol")
                         if not symbol or symbol not in SYMBOLS:
-                            logger.warning(f"⚠️ Unknown symbol: {symbol}")
+                            logger.debug(f"⚠️ Ignoring symbol: {symbol}")
                             continue
 
                         # Check for day rollover
@@ -383,15 +418,18 @@ async def delta_ws_listener():
                         
                         # Generate trading signals if analysis worker is active
                         if ANALYSIS_ENABLED and analysis_worker:
-                            indicators = analysis_worker.get_indicators(symbol)
-                            if indicators:
-                                signal = generate_trading_signal(symbol, indicators.get("indicators", {}))
-                                if signal["signal"] != "NEUTRAL":
-                                    trading_signals[symbol] = {
-                                        **signal,
-                                        "symbol": symbol,
-                                        "current_price": latest_ticks[symbol]["price"],
-                                    }
+                            try:
+                                indicators = analysis_worker.get_indicators(symbol)
+                                if indicators:
+                                    signal = generate_trading_signal(symbol, indicators.get("indicators", {}))
+                                    if signal["signal"] != "NEUTRAL":
+                                        trading_signals[symbol] = {
+                                            **signal,
+                                            "symbol": symbol,
+                                            "current_price": latest_ticks[symbol]["price"],
+                                        }
+                            except Exception as e:
+                                logger.debug(f"Signal generation error for {symbol}: {e}")
                         
                         # Broadcast to all connected clients
                         await broadcast()
@@ -415,7 +453,7 @@ async def delta_ws_listener():
             is_delta_connected = False
             logger.error(f"❌ Unexpected error in Delta WS: {e}", exc_info=True)
         
-        # Wait before reconnecting (unless shutting down)
+        # ✅ FIXED: Exponential backoff for reconnection
         if not shutdown_event.is_set():
             logger.info(f"🔄 Reconnecting in {reconnect_delay} seconds...")
             try:
@@ -425,6 +463,9 @@ async def delta_ws_listener():
                 )
             except asyncio.TimeoutError:
                 pass  # Continue to reconnect
+            
+            # Increase delay for next attempt (exponential backoff)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
     
     logger.info("🛑 Delta WS listener stopped")
 
@@ -511,21 +552,6 @@ async def _process_ticker_data(symbol: str, data: dict):
         "last_update": datetime.now(timezone.utc).timestamp(),
     })
 
-async def _process_trade_data(symbol: str, data: dict):
-    """Process trade data (for volume analysis)"""
-    # This would process recent trades for volume profile analysis
-    trades = data.get("trades", [])
-    if trades:
-        # Update volume profile
-        buy_volume = sum(t['size'] for t in trades if t.get('side') == 'buy')
-        sell_volume = sum(t['size'] for t in trades if t.get('side') == 'sell')
-        
-        latest_ticks[symbol]["liquidity"].update({
-            "recent_buy_volume": buy_volume,
-            "recent_sell_volume": sell_volume,
-            "buy_sell_ratio": buy_volume / sell_volume if sell_volume > 0 else 0,
-        })
-
 # ===============================
 # BROADCAST TO CLIENTS
 # ===============================
@@ -540,7 +566,7 @@ async def broadcast():
         try:
             indicators_data = analysis_worker.get_all_indicators()
         except Exception as e:
-            logger.error(f"❌ Error getting indicators: {e}")
+            logger.debug(f"Error getting indicators: {e}")
 
     payload = {
         "status": "connected" if is_delta_connected else "reconnecting",
@@ -557,7 +583,7 @@ async def broadcast():
         try:
             await ws.send_json(payload)
         except Exception as e:
-            logger.warning(f"⚠️ Failed to send to client: {e}")
+            logger.debug(f"Failed to send to client: {e}")
             dead.add(ws)
 
     # Remove dead connections
@@ -594,9 +620,17 @@ async def lifespan(app: FastAPI):
     
     if ws_task and not ws_task.done():
         ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
     
     if analysis_task and not analysis_task.done():
         analysis_task.cancel()
+        try:
+            await analysis_task
+        except asyncio.CancelledError:
+            pass
     
     if analysis_worker:
         try:
@@ -684,8 +718,14 @@ def trading_calculator(
             "message": "No price data available"
         }
     
-    # Calculate position size
-    position_size = calculate_position_size(symbol, risk_amount, stop_loss_percent)
+    # ✅ FIXED: Calculate position size in contracts (integer)
+    num_contracts = calculate_position_size(symbol, risk_amount, stop_loss_percent)
+    
+    # Get contract value
+    contract_value = TRADING_CONFIG["contract_values"].get(symbol, 1)
+    
+    # Position value = contracts * contract_value * price
+    position_value = num_contracts * contract_value * current_price
     
     # Calculations
     stop_loss_price = current_price * (1 - stop_loss_percent/100)
@@ -693,24 +733,34 @@ def trading_calculator(
     risk_reward_ratio = take_profit_percent / stop_loss_percent
     
     # Leverage calculations
-    position_value = position_size * current_price
     margin_required = position_value / leverage
-    liquidation_price = current_price * (1 - (1/leverage) + 0.01) if leverage > 1 else None
+    
+    # Liquidation price (simplified - actual calculation is more complex)
+    if leverage > 1:
+        liquidation_buffer = (1 / leverage) * 0.9  # 90% of margin
+        liquidation_price = current_price * (1 - liquidation_buffer)
+    else:
+        liquidation_price = None
+    
+    # P&L calculations
+    potential_loss = num_contracts * contract_value * (current_price - stop_loss_price)
+    potential_profit = num_contracts * contract_value * (take_profit_price - current_price)
     
     return {
         "status": "success",
         "symbol": symbol,
         "current_price": current_price,
         "calculations": {
-            "position_size": round(position_size, 6),
+            "num_contracts": num_contracts,  # ✅ Integer value
+            "contract_value": contract_value,
             "position_value_usd": round(position_value, 2),
             "stop_loss_price": round(stop_loss_price, 2),
             "take_profit_price": round(take_profit_price, 2),
             "stop_loss_percent": stop_loss_percent,
             "take_profit_percent": take_profit_percent,
             "risk_amount_usd": risk_amount,
-            "potential_loss_usd": round(position_size * (current_price - stop_loss_price), 2),
-            "potential_profit_usd": round(position_size * (take_profit_price - current_price), 2),
+            "potential_loss_usd": round(potential_loss, 2),
+            "potential_profit_usd": round(potential_profit, 2),
             "risk_reward_ratio": round(risk_reward_ratio, 2),
         },
         "leverage": {
@@ -733,10 +783,11 @@ def get_trading_signals(symbol: str = None):
             }
         
         signal = trading_signals.get(symbol)
-        if not signal:
+        if not signal or signal.get("signal") == "NEUTRAL":
             return {
                 "status": "no_signal",
-                "message": "No trading signals available"
+                "message": "No active trading signals",
+                "symbol": symbol,
             }
         
         return {
@@ -786,6 +837,7 @@ def get_symbol_data(symbol: str):
     trading_info = {
         "min_order_size": TRADING_CONFIG["min_order_size"].get(symbol),
         "tick_size": TRADING_CONFIG["tick_size"].get(symbol),
+        "contract_value": TRADING_CONFIG["contract_values"].get(symbol),
         "leverage_options": TRADING_CONFIG["leverage_options"],
     }
     
@@ -830,13 +882,52 @@ def get_all_indicators():
         logger.error(f"Error in /indicators: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/indicators/{symbol}")
+def get_symbol_indicators(symbol: str):
+    """Get technical indicators for a specific symbol"""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return {
+            "status": "error",
+            "message": f"Symbol {symbol} not supported"
+        }
+    
+    if not ANALYSIS_ENABLED or not analysis_worker:
+        return {
+            "status": "disabled",
+            "message": "Analysis worker not available"
+        }
+    
+    try:
+        indicators = analysis_worker.get_indicators(symbol)
+        
+        if not indicators:
+            return {
+                "status": "no_data",
+                "message": "No indicator data available yet",
+                "symbol": symbol,
+            }
+        
+        # Generate signal
+        signal = generate_trading_signal(symbol, indicators.get("indicators", {}))
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "indicators": indicators,
+            "signal": signal,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error getting indicators for {symbol}: {e}")
+        return {"status": "error", "message": str(e)}
+
 # ===============================
 # WEBSOCKET ENDPOINT
 # ===============================
-# Add this endpoint to match your client's expectation
 @app.websocket("/ws/market")
 async def ws_market(ws: WebSocket):
-    """WebSocket endpoint for real-time market data (alias for /ws/trading)"""
+    """WebSocket endpoint for real-time market data"""
     await ws.accept()
     active_clients.add(ws)
     logger.info(f"✅ Market client connected. Total: {len(active_clients)}")
@@ -857,18 +948,27 @@ async def ws_market(ws: WebSocket):
                     cmd_type = command.get("type")
                     
                     if cmd_type == "ping":
-                        await ws.send_json({"type": "pong"})
+                        await ws.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
                     elif cmd_type == "subscribe":
                         # Handle symbol subscription
                         symbols = command.get("symbols", [])
                         await ws.send_json({
                             "type": "subscribed",
                             "symbols": symbols,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
                         })
                     elif cmd_type == "get_portfolio":
                         await ws.send_json({
                             "type": "portfolio",
                             "data": user_portfolio,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    elif cmd_type == "get_signals":
+                        active_signals = {s: sig for s, sig in trading_signals.items() if sig.get("signal") != "NEUTRAL"}
+                        await ws.send_json({
+                            "type": "signals",
+                            "data": active_signals,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
                         })
                     
                 except json.JSONDecodeError:
@@ -877,7 +977,10 @@ async def ws_market(ws: WebSocket):
             except asyncio.TimeoutError:
                 # Send ping to keep connection alive
                 try:
-                    await ws.send_json({"type": "ping"})
+                    await ws.send_json({
+                        "type": "ping",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
                 except Exception:
                     break
                     
@@ -888,6 +991,14 @@ async def ws_market(ws: WebSocket):
     finally:
         active_clients.discard(ws)
         logger.info(f"📊 Active clients: {len(active_clients)}")
+
+# ===============================
+# ADDITIONAL WEBSOCKET ENDPOINT (ALIAS)
+# ===============================
+@app.websocket("/ws/trading")
+async def ws_trading(ws: WebSocket):
+    """WebSocket endpoint for trading (alias for /ws/market)"""
+    await ws_market(ws)
 
 # ===============================
 # RUN SERVER
@@ -905,4 +1016,3 @@ if __name__ == "__main__":
         access_log=True,
         timeout_keep_alive=75,
     )
-
