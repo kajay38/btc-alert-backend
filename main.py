@@ -2,9 +2,10 @@ import asyncio
 import json
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Set
 from contextlib import asynccontextmanager
+import aiohttp
 
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -31,15 +32,20 @@ logger = logging.getLogger("DELTA-BACKEND")
 # CONFIG - DELTA EXCHANGE INDIA
 # ===============================
 DELTA_WS_URL = "wss://socket.delta.exchange"
+DELTA_REST_URL = "https://api.india.delta.exchange"
 
 SYMBOLS = [
     "BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD",
     "ADAUSD", "DOGEUSD", "DOTUSD", "LTCUSD", "MATICUSD",
 ]
 
+# ✅ Feature flags
+ENABLE_ORDER_BOOK = True  # Set to False to disable order book subscription
+FETCH_HISTORICAL_DATA = True  # Fetch previous day data on startup
+
 # ✅ CORRECTED Trading Configuration
 TRADING_CONFIG = {
-    "min_order_size": {s: 1 for s in SYMBOLS},  # All are 1 contract
+    "min_order_size": {s: 1 for s in SYMBOLS},
     "tick_size": {
         "BTCUSD": 0.5, "ETHUSD": 0.05, "SOLUSD": 0.0001,
         "BNBUSD": 0.001, "XRPUSD": 0.0001, "ADAUSD": 0.00001,
@@ -94,6 +100,56 @@ if ANALYSIS_ENABLED:
     except Exception as e:
         logger.error(f"❌ Failed to initialize analysis worker: {e}")
         ANALYSIS_ENABLED = False
+
+# ===============================
+# REST API FUNCTIONS
+# ===============================
+async def fetch_previous_day_data():
+    """Fetch previous day OHLCV data for all symbols"""
+    logger.info("📊 Fetching previous day data...")
+    
+    # Calculate timestamps for yesterday
+    now = datetime.now(timezone.utc)
+    yesterday_start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_end = yesterday_start + timedelta(days=1)
+    
+    start_ts = int(yesterday_start.timestamp())
+    end_ts = int(yesterday_end.timestamp())
+    
+    async with aiohttp.ClientSession() as session:
+        for symbol in SYMBOLS:
+            try:
+                url = f"{DELTA_REST_URL}/v2/history/candles"
+                params = {
+                    "resolution": "1d",
+                    "symbol": symbol,
+                    "start": start_ts,
+                    "end": end_ts
+                }
+                
+                async with session.get(url, params=params, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        result = data.get("result", [])
+                        
+                        if result and len(result) > 0:
+                            candle = result[-1]  # Get last candle (yesterday)
+                            
+                            latest_ticks[symbol]["previous_day"] = {
+                                "open": candle.get("open"),
+                                "high": candle.get("high"),
+                                "low": candle.get("low"),
+                                "close": candle.get("close"),
+                                "volume": candle.get("volume"),
+                            }
+                            logger.info(f"✅ Loaded previous day data for {symbol}")
+                    else:
+                        logger.warning(f"⚠️ Failed to fetch data for {symbol}: {response.status}")
+                        
+            except Exception as e:
+                logger.error(f"❌ Error fetching data for {symbol}: {e}")
+    
+    logger.info("✅ Previous day data loaded")
 
 # ===============================
 # HELPER FUNCTIONS
@@ -161,10 +217,10 @@ def generate_trading_signal(symbol: str, indicators: dict) -> dict:
     }
 
 # ===============================
-# WEBSOCKET LISTENER (FIXED)
+# WEBSOCKET LISTENER (ENHANCED)
 # ===============================
 async def delta_ws_listener():
-    """Connect to Delta Exchange WebSocket"""
+    """Connect to Delta Exchange WebSocket with order book support"""
     global is_delta_connected
     
     reconnect_delay = 5
@@ -182,11 +238,17 @@ async def delta_ws_listener():
                 close_timeout=10,
             ) as ws:
 
+                # ✅ Build subscription channels
+                channels = [{"name": "v2/ticker", "symbols": SYMBOLS}]
+                
+                # ✅ Add order book channel if enabled
+                if ENABLE_ORDER_BOOK:
+                    channels.append({"name": "l2_orderbook", "symbols": SYMBOLS})
+                    logger.info("📖 Order book subscription enabled")
+
                 subscribe_msg = {
                     "type": "subscribe",
-                    "payload": {
-                        "channels": [{"name": "v2/ticker", "symbols": SYMBOLS}]
-                    },
+                    "payload": {"channels": channels}
                 }
 
                 await ws.send(json.dumps(subscribe_msg))
@@ -205,7 +267,7 @@ async def delta_ws_listener():
                         data = json.loads(msg)
                         message_count += 1
                         
-                        # Log first few messages for debugging
+                        # Log first few messages
                         if message_count <= 3:
                             logger.info(f"📨 Message #{message_count}: {json.dumps(data)[:150]}...")
                         
@@ -216,7 +278,12 @@ async def delta_ws_listener():
                             logger.info(f"✅ Subscription confirmed")
                             continue
                         
-                        # ✅ FIXED: Process ticker data (no "type" field in ticker messages)
+                        # ✅ Handle order book data
+                        if msg_type == "l2_orderbook":
+                            await _process_orderbook_data(data)
+                            continue
+                        
+                        # ✅ Process ticker data (no "type" field in ticker messages)
                         symbol = data.get("symbol")
                         
                         if symbol and symbol in SYMBOLS:
@@ -349,6 +416,42 @@ async def _process_ticker_data(symbol: str, data: dict):
         "last_update": datetime.now(timezone.utc).timestamp(),
     })
 
+
+async def _process_orderbook_data(data: dict):
+    """Process L2 order book data"""
+    symbol = data.get("symbol")
+    if not symbol or symbol not in SYMBOLS:
+        return
+    
+    buy_orders = data.get("buy", [])
+    sell_orders = data.get("sell", [])
+    
+    # Convert to standard format
+    bids = [[float(order["limit_price"]), float(order["size"])] for order in buy_orders[:10]]
+    asks = [[float(order["limit_price"]), float(order["size"])] for order in sell_orders[:10]]
+    
+    # Calculate total depth
+    total_bid_volume = sum(order["size"] for order in buy_orders)
+    total_ask_volume = sum(order["size"] for order in sell_orders)
+    
+    # Calculate spread
+    spread = None
+    if bids and asks:
+        spread = asks[0][0] - bids[0][0]
+    
+    latest_ticks[symbol]["order_book"] = {
+        "bids": bids,
+        "asks": asks,
+        "spread": round(spread, 4) if spread else None,
+        "depth": len(buy_orders) + len(sell_orders),
+    }
+    
+    # Update liquidity data
+    latest_ticks[symbol]["liquidity"].update({
+        "bid_volume": total_bid_volume,
+        "ask_volume": total_ask_volume,
+    })
+
 # ===============================
 # BROADCAST
 # ===============================
@@ -390,6 +493,10 @@ async def broadcast():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting application...")
+    
+    # ✅ Fetch historical data on startup
+    if FETCH_HISTORICAL_DATA:
+        await fetch_previous_day_data()
     
     ws_task = asyncio.create_task(delta_ws_listener())
     
@@ -440,7 +547,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Delta India Trading API",
     description="Real-time trading data from Delta Exchange India",
-    version="2.0.1",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -463,6 +570,7 @@ def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "websocket_connected": is_delta_connected,
         "analysis_enabled": ANALYSIS_ENABLED,
+        "order_book_enabled": ENABLE_ORDER_BOOK,
         "active_clients": len(active_clients),
         "symbols": SYMBOLS,
     }
@@ -472,6 +580,11 @@ def get_trading_config():
     return {
         "status": "success",
         "config": TRADING_CONFIG,
+        "features": {
+            "order_book": ENABLE_ORDER_BOOK,
+            "historical_data": FETCH_HISTORICAL_DATA,
+            "analysis": ANALYSIS_ENABLED,
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
