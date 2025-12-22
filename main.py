@@ -52,21 +52,21 @@ SYMBOLS = [
 # ✅ Trading के लिए जरूरी configuration
 TRADING_CONFIG = {
     "min_order_size": {
-        "BTCUSD": 0.001,
-        "ETHUSD": 0.01,
-        "SOLUSD": 0.1,
-        "BNBUSD": 0.01,
-        "XRPUSD": 10,
-        "ADAUSD": 10,
-        "DOGEUSD": 100,
-        "DOTUSD": 1,
-        "LTCUSD": 0.1,
-        "MATICUSD": 10,
-    },
+      "BTCUSD": 1,      # 1 contract = 0.001 BTC
+    "ETHUSD": 1,      # 1 contract = 0.01 ETH
+    "SOLUSD": 1,      # 1 contract = 1 SOL
+    "BNBUSD": 1,
+    "XRPUSD": 1,
+    "ADAUSD": 1,
+    "DOGEUSD": 1,
+    "DOTUSD": 1,
+    "LTCUSD": 1,
+    "MATICUSD": 1,
+}
     "tick_size": {
         "BTCUSD": 0.5,
         "ETHUSD": 0.05,
-        "SOLUSD": 0.01,
+        "SOLUSD": 0.0001,
         "BNBUSD": 0.01,
         "XRPUSD": 0.0001,
         "ADAUSD": 0.0001,
@@ -188,33 +188,26 @@ if ANALYSIS_ENABLED:
 # ===============================
 # TRADING HELPER FUNCTIONS
 # ===============================
-def calculate_position_size(symbol: str, risk_amount: float, stop_loss_percent: float) -> float:
+def calculate_position_size(symbol: str, risk_amount: float, stop_loss_percent: float) -> int:
     """
     Position size calculator (Risk Management)
-    
-    Args:
-        symbol: Trading symbol
-        risk_amount: Amount willing to risk (in USD)
-        stop_loss_percent: Stop loss percentage
-    
-    Returns:
-        float: Position size in coin units
+    Returns: Number of contracts (integer)
     """
     current_price = latest_ticks[symbol].get("price")
     if not current_price:
-        return 0
-    
-    min_size = TRADING_CONFIG["min_order_size"].get(symbol, 0.001)
+        return 1  # Minimum 1 contract
     
     # Calculate position size
     risk_per_unit = current_price * (stop_loss_percent / 100)
     if risk_per_unit == 0:
-        return min_size
+        return 1
     
     position_size = risk_amount / risk_per_unit
     
-    # Apply min order size
-    return max(position_size, min_size)
+    # ✅ Round to nearest integer (contracts must be whole numbers)
+    contracts = max(1, round(position_size))
+    
+    return contracts
 
 def calculate_support_resistance(candles: list, period: int = 20) -> dict:
     """
@@ -356,7 +349,7 @@ async def delta_ws_listener():
                             continue
                         
                         # ✅ FIXED: Check for "type" field, not "channel"
-                        if msg_type != "v2/ticker":
+                        if msg_type != "ticker":
                             # Log unexpected messages for debugging
                             logger.debug(f"Received message type: {msg_type}")
                             continue
